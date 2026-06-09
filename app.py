@@ -57,6 +57,63 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def normalize_ship_name(value: Any) -> str:
+    return str(value).strip().upper()
+
+
+def unique_ship_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        name = normalize_ship_name(value)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    return result
+
+
+def watch_summary(watch: Dict[str, Any], token: str = "", ship_name: str = "") -> Dict[str, Any]:
+    """
+    watch 구조:
+    {
+      "FCM_TOKEN_A": {
+        "ships": ["BOW EXCELLENCE", "KEOYOUNG SUN3"],
+        "updatedAt": "..."
+      }
+    }
+    """
+    total_watch_devices = len(watch)
+
+    total_watch_links = 0
+    total_watch_ships_set = set()
+    my_watch_count = 0
+    ship_watch_device_count = 0
+
+    normalized_ship = normalize_ship_name(ship_name)
+
+    for device_token, item in watch.items():
+        ships = unique_ship_list(item.get("ships", [])) if isinstance(item, dict) else []
+        total_watch_links += len(ships)
+        total_watch_ships_set.update(ships)
+
+        if token and device_token == token:
+            my_watch_count = len(ships)
+
+        if normalized_ship and normalized_ship in ships:
+            ship_watch_device_count += 1
+
+    return {
+        "watchDeviceCount": total_watch_devices,              # 감시 등록된 기기 수
+        "totalWatchShips": len(total_watch_ships_set),        # 전체 서버에서 감시 중인 고유 선박 수
+        "totalWatchLinks": total_watch_links,                 # 기기-선박 연결 총합
+        "myWatchCount": my_watch_count,                       # 현재 휴대폰이 감시 중인 선박 수
+        "shipWatchDeviceCount": ship_watch_device_count,      # 해당 선박을 감시 중인 기기 수
+    }
+
+
 def init_firebase() -> None:
     global firebase_ready, firebase_error
     if firebase_ready:
@@ -93,21 +150,27 @@ def before_request() -> None:
 def index():
     tokens = read_json(TOKENS_FILE, [])
     watch = read_json(WATCH_FILE, {})
+    summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "2.9.6",
+        "version": "2.9.8",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
         "tokenCount": len(tokens),
-        "watchDeviceCount": len(watch),
+        **summary,
         "time": now_iso(),
     })
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "firebaseReady": firebase_ready, "firebaseError": firebase_error, "time": now_iso()})
+    return jsonify({
+        "ok": True,
+        "firebaseReady": firebase_ready,
+        "firebaseError": firebase_error,
+        "time": now_iso(),
+    })
 
 
 @app.post("/register-token")
@@ -191,9 +254,7 @@ def send_test():
                 },
                 android=messaging.AndroidConfig(
                     priority="high",
-                    notification=messaging.AndroidNotification(
-                        sound="default",
-                    ),
+                    notification=messaging.AndroidNotification(sound="default"),
                 ),
             )
             message_id = messaging.send(msg)
@@ -204,7 +265,14 @@ def send_test():
             errors.append(str(exc))
 
     history = read_json(EVENT_FILE, [])
-    history.insert(0, {"type": "test", "title": title, "body": body, "success": success, "errors": errors[:5], "time": now_iso()})
+    history.insert(0, {
+        "type": "test",
+        "title": title,
+        "body": body,
+        "success": success,
+        "errors": errors[:5],
+        "time": now_iso(),
+    })
     write_json(EVENT_FILE, history[:200])
     return jsonify({"ok": True, "requested": len(target_tokens), "success": success, "errors": errors[:5]})
 
@@ -213,20 +281,101 @@ def send_test():
 def register_watch():
     if not require_api_key():
         return jsonify({"ok": False, "error": "invalid api key"}), 401
+
     payload = request.get_json(silent=True) or {}
     token = str(payload.get("token", "")).strip()
     ships = payload.get("ships", [])
+
     if not token:
         return jsonify({"ok": False, "error": "token is required"}), 400
     if not isinstance(ships, list):
         return jsonify({"ok": False, "error": "ships must be a list"}), 400
+
+    normalized_ships = unique_ship_list(ships)
     watch = read_json(WATCH_FILE, {})
     watch[token] = {
-        "ships": [str(s).strip().upper() for s in ships if str(s).strip()],
+        "ships": normalized_ships,
         "updatedAt": now_iso(),
     }
     write_json(WATCH_FILE, watch)
-    return jsonify({"ok": True, "registeredShips": len(watch[token]["ships"])})
+
+    ship_name = normalized_ships[-1] if normalized_ships else ""
+    summary = watch_summary(watch, token=token, ship_name=ship_name)
+
+    print(f"REGISTER WATCH token={token[:12]}... ships={normalized_ships} summary={summary}")
+
+    return jsonify({
+        "ok": True,
+        "registered": True,
+        "registeredShips": len(normalized_ships),
+        "ships": normalized_ships,
+        **summary,
+        "time": now_iso(),
+    })
+
+
+@app.post("/unregister-watch")
+def unregister_watch():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    token = str(payload.get("token", "")).strip()
+    ships = payload.get("ships", [])
+
+    if not token:
+        return jsonify({"ok": False, "error": "token is required"}), 400
+    if not isinstance(ships, list):
+        return jsonify({"ok": False, "error": "ships must be a list"}), 400
+
+    normalized_ships = unique_ship_list(ships)
+    watch = read_json(WATCH_FILE, {})
+
+    if normalized_ships:
+        watch[token] = {
+            "ships": normalized_ships,
+            "updatedAt": now_iso(),
+        }
+    else:
+        watch.pop(token, None)
+
+    write_json(WATCH_FILE, watch)
+
+    ship_name = str(payload.get("shipName", "")).strip()
+    summary = watch_summary(watch, token=token, ship_name=ship_name)
+
+    print(f"UNREGISTER WATCH token={token[:12]}... ships={normalized_ships} summary={summary}")
+
+    return jsonify({
+        "ok": True,
+        "unregistered": True,
+        "registeredShips": len(normalized_ships),
+        "ships": normalized_ships,
+        **summary,
+        "time": now_iso(),
+    })
+
+
+@app.post("/watch-status")
+def watch_status():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    token = str(payload.get("token", "")).strip()
+
+    watch = read_json(WATCH_FILE, {})
+    my_ships = []
+    if token and token in watch and isinstance(watch[token], dict):
+        my_ships = unique_ship_list(watch[token].get("ships", []))
+
+    summary = watch_summary(watch, token=token)
+    return jsonify({
+        "ok": True,
+        "ships": my_ships,
+        **summary,
+        "time": now_iso(),
+    })
 
 
 @app.get("/alerts/demo")
