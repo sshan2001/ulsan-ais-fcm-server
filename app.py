@@ -192,7 +192,6 @@ def send_test():
                 android=messaging.AndroidConfig(
                     priority="high",
                     notification=messaging.AndroidNotification(
-                        channel_id="ulsan_ais_alerts",
                         sound="default",
                     ),
                 ),
