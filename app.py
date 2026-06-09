@@ -196,9 +196,11 @@ def send_test():
                     ),
                 ),
             )
-            messaging.send(msg)
+            messaging.send(msg
+            print(f"FCM SUCCESS: {message_id}")    
             success += 1
         except Exception as exc:
+            print(f"FCM ERROR: {exc}")
             errors.append(str(exc))
 
     history = read_json(EVENT_FILE, [])
