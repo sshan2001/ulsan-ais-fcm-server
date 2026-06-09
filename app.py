@@ -196,8 +196,8 @@ def send_test():
                     ),
                 ),
             )
-            messaging.send(msg)
-            print(f"FCM SUCCESS: {message_id}")    
+            message_id = messaging.send(msg)
+            print(f"FCM SUCCESS: {message_id}")
             success += 1
         except Exception as exc:
             print(f"FCM ERROR: {exc}")
