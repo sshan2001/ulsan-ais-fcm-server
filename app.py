@@ -26,6 +26,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 TOKENS_FILE = DATA_DIR / "tokens.json"
 WATCH_FILE = DATA_DIR / "watchlist.json"
 EVENT_FILE = DATA_DIR / "event_history.json"
+AIS_ALERT_FILE = DATA_DIR / "ais_alert_state.json"
+
+AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "30"))
 
 SERVER_API_KEY = os.environ.get("SERVER_API_KEY", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -57,6 +60,51 @@ def read_json(path: Path, fallback: Any) -> Any:
 
 def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def parse_iso_time(value: str):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def should_send_ais_alert(ship_name: str, event_type: str, force: bool = False) -> tuple[bool, str]:
+    """
+    같은 선박의 같은 이벤트가 너무 자주 반복 발송되지 않도록 막습니다.
+    force=True이면 중복 방지를 무시하고 테스트 발송합니다.
+    """
+    if force:
+        return True, "forced"
+
+    key = f"{normalize_ship_name(ship_name)}::{event_type}"
+    state = read_json(AIS_ALERT_FILE, {})
+    now = datetime.now(timezone.utc)
+
+    previous_raw = state.get(key, {}).get("sentAt") if isinstance(state.get(key), dict) else None
+    previous_dt = parse_iso_time(previous_raw) if previous_raw else None
+
+    if previous_dt is not None:
+        diff_minutes = (now - previous_dt).total_seconds() / 60
+        if diff_minutes < AIS_ALERT_COOLDOWN_MINUTES:
+            remain = max(1, int(AIS_ALERT_COOLDOWN_MINUTES - diff_minutes))
+            return False, f"cooldown {remain}min remaining"
+
+    state[key] = {
+        "shipName": normalize_ship_name(ship_name),
+        "eventType": event_type,
+        "sentAt": now.isoformat(),
+    }
+
+    # 오래된 기록 정리: 24시간 지난 중복방지 기록 삭제
+    cleaned = {}
+    for item_key, item in state.items():
+        sent_at = parse_iso_time(item.get("sentAt")) if isinstance(item, dict) else None
+        if sent_at is not None and (now - sent_at).total_seconds() <= 24 * 3600:
+            cleaned[item_key] = item
+
+    write_json(AIS_ALERT_FILE, cleaned)
+    return True, "ok"
 
 
 def normalize_ship_name(value: Any) -> str:
@@ -270,7 +318,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "2.9.10",
+        "version": "2.9.11",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -458,6 +506,9 @@ def check_ais_once():
     if not firebase_ready:
         return jsonify({"ok": False, "error": "firebase not ready", "firebaseError": firebase_error}), 500
 
+    payload = request.get_json(silent=True) or {}
+    force = bool(payload.get("force", False))
+
     watch = read_json(WATCH_FILE, {})
     watched_ships = set()
 
@@ -494,10 +545,16 @@ def check_ais_once():
             }
 
     sent = []
+    skipped = []
     errors = []
     for ship_name, info in detected_ships.items():
         target_tokens = tokens_for_ship(ship_name)
         if not target_tokens:
+            continue
+
+        can_send, reason = should_send_ais_alert(ship_name, "ais_detected", force=force)
+        if not can_send:
+            skipped.append({"shipName": ship_name, "reason": reason})
             continue
 
         title = f"🚢 {ship_name} AIS 감지"
@@ -529,6 +586,9 @@ def check_ais_once():
         "detectedCount": len(detected_ships),
         "detectedShips": sorted(detected_ships.keys()),
         "sentShips": sent,
+        "skippedShips": skipped,
+        "force": force,
+        "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
         "errors": errors[:5],
         "time": now_iso(),
     })
@@ -541,6 +601,9 @@ def check_ais_once():
         "detectedCount": len(detected_ships),
         "detectedShips": sorted(detected_ships.keys()),
         "sentShips": sent,
+        "skippedShips": skipped,
+        "force": force,
+        "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
         "errors": errors[:5],
         "time": now_iso(),
     })
@@ -643,6 +706,25 @@ def watch_status():
         "ok": True,
         "ships": my_ships,
         **summary,
+        "time": now_iso(),
+    })
+
+
+@app.get("/alert-history")
+def alert_history():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    history = read_json(EVENT_FILE, [])
+    alert_state = read_json(AIS_ALERT_FILE, {})
+
+    return jsonify({
+        "ok": True,
+        "historyCount": len(history),
+        "recentHistory": history[:30] if isinstance(history, list) else [],
+        "cooldownCount": len(alert_state) if isinstance(alert_state, dict) else 0,
+        "cooldownState": alert_state if isinstance(alert_state, dict) else {},
+        "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
         "time": now_iso(),
     })
 
