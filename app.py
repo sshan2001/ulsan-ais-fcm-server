@@ -28,6 +28,7 @@ TOKENS_FILE = DATA_DIR / "tokens.json"
 WATCH_FILE = DATA_DIR / "watchlist.json"
 EVENT_FILE = DATA_DIR / "event_history.json"
 AIS_ALERT_FILE = DATA_DIR / "ais_alert_state.json"
+AIS_SHIP_STATE_FILE = DATA_DIR / "ais_ship_state.json"
 
 AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "30"))
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
@@ -328,7 +329,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "2.9.12-fixed",
+        "version": "2.9.13",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -516,10 +517,140 @@ def test_ship_alert():
 
 
 
+
+def is_underway_like(status: str, speed: float) -> bool:
+    value = str(status).upper()
+    return (
+        speed >= 3.0
+        or "항해" in value
+        or "UNDER" in value
+        or "SAILING" in value
+        or "NAVIGATION" in value
+    )
+
+
+def is_stopped_like(status: str, speed: float) -> bool:
+    value = str(status).upper()
+    return (
+        speed <= 1.0
+        or "정박" in value
+        or "접안" in value
+        or "묘박" in value
+        or "투묘" in value
+        or "MOORED" in value
+        or "ANCHOR" in value
+        or "BERTH" in value
+        or "DOCK" in value
+    )
+
+
+def simple_area_from_lat_lon(lat: float, lon: float) -> str:
+    if lat == 0 or lon == 0:
+        return "위치 확인중"
+
+    # 울산항 주변의 대략적인 구역명입니다. 정확한 부두/묘박지 판정은 2.9.14에서 세분화합니다.
+    if lat >= 35.48 and lon >= 129.42:
+        return "외항/동측 해역"
+    if lat >= 35.43 and lon >= 129.35:
+        return "울산항 접근 해역"
+    if lat >= 35.37 and lon >= 129.33:
+        return "울산항 항내/부두권"
+    return "울산항 인근"
+
+
+def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
+    lat = float(info.get("lat", 0.0) or 0.0)
+    lon = float(info.get("lon", 0.0) or 0.0)
+    speed = float(info.get("speed", 0.0) or 0.0)
+    status = str(info.get("status", "-"))
+    location = str(info.get("location") or simple_area_from_lat_lon(lat, lon))
+
+    return {
+        "shipName": normalize_ship_name(ship_name),
+        "mmsi": str(info.get("mmsi", "-")),
+        "status": status,
+        "speed": speed,
+        "lat": lat,
+        "lon": lon,
+        "location": location,
+        "destination": str(info.get("destination", "-")),
+        "eta": str(info.get("eta", "-")),
+        "seenAt": now_iso(),
+    }
+
+
+def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[str, Any] | None, force: bool = False) -> List[Dict[str, str]]:
+    """
+    이전 AIS 상태와 현재 AIS 상태를 비교해서 발송할 이벤트 목록을 만듭니다.
+    """
+    events: List[Dict[str, str]] = []
+    name = normalize_ship_name(ship_name)
+
+    current_status = str(current.get("status", "-"))
+    current_speed = float(current.get("speed", 0.0) or 0.0)
+    current_location = str(current.get("location", "위치 확인중"))
+
+    if previous is None:
+        events.append({
+            "eventType": "ais_first_detected",
+            "title": f"🚢 {name} AIS 최초 감지",
+            "body": f"{name} 선박이 울산항 AIS에서 처음 감지되었습니다. 위치: {current_location}",
+        })
+        return events
+
+    previous_status = str(previous.get("status", "-"))
+    previous_speed = float(previous.get("speed", 0.0) or 0.0)
+    previous_location = str(previous.get("location", "위치 확인중"))
+
+    prev_stopped = is_stopped_like(previous_status, previous_speed)
+    now_stopped = is_stopped_like(current_status, current_speed)
+    prev_underway = is_underway_like(previous_status, previous_speed)
+    now_underway = is_underway_like(current_status, current_speed)
+
+    if prev_stopped and now_underway:
+        events.append({
+            "eventType": "departure_detected",
+            "title": f"🔔 {name} 출항 · 이동 시작",
+            "body": f"{name} 선박이 {previous_location}에서 이동을 시작했습니다. 현재 속도: {current_speed:.1f} kn",
+        })
+
+    if prev_underway and now_stopped:
+        events.append({
+            "eventType": "anchored_or_docked",
+            "title": f"⚓ {name} 정박 · 접안 감지",
+            "body": f"{name} 선박이 정박 또는 접안 상태로 감지되었습니다. 위치: {current_location}",
+        })
+
+    if previous_status != current_status:
+        events.append({
+            "eventType": f"status_changed:{current_status}",
+            "title": f"📡 {name} AIS 상태 변화",
+            "body": f"{name} 상태가 {previous_status} → {current_status} 로 변경되었습니다.",
+        })
+
+    if previous_location != current_location and current_location != "위치 확인중":
+        events.append({
+            "eventType": f"location_changed:{current_location}",
+            "title": f"📍 {name} 위치 변화",
+            "body": f"{name} 위치가 {previous_location} → {current_location} 로 변경되었습니다.",
+        })
+
+    # 너무 조용한 선박도 force 테스트에서는 감지 이벤트를 확인할 수 있게 합니다.
+    if force and not events:
+        events.append({
+            "eventType": "ais_force_status_check",
+            "title": f"🚢 {name} AIS 상태 확인",
+            "body": f"{name} 현재 상태: {current_status}, 속도: {current_speed:.1f} kn, 위치: {current_location}",
+        })
+
+    return events
+
+
+
 def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[str, Any]:
     """
-    UPA AIS를 1회 조회하고, watchlist에 등록된 선박이 감지되면 해당 사용자에게만 FCM을 발송합니다.
-    force=True이면 중복방지 쿨다운을 무시합니다.
+    UPA AIS를 1회 조회하고, watchlist에 등록된 선박의 상태 변화를 감지해서 해당 사용자에게만 FCM을 발송합니다.
+    2.9.13부터는 단순 감지가 아니라 이전 상태와 비교해 입항/출항/정박/상태/위치 변화를 분리합니다.
     """
     if not firebase_ready:
         return {
@@ -561,52 +692,88 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
     for item in ais_list:
         name = pick_ship_name(item)
         if name and name in watched_ships:
+            lat = pick_float(item, ["lat", "latitude", "la", "vslLat"], 0.0)
+            lon = pick_float(item, ["lot", "lon", "lng", "longitude", "vslLot"], 0.0)
             detected_ships[name] = {
                 "name": name,
                 "mmsi": pick_text(item, ["aisMmsi", "mmsi", "MMSI", "mmsiNo"], "-"),
                 "status": pick_text(item, ["oprtlSttsKr", "oprtlStts", "status", "navStatus", "nvgtStts", "state"], "-"),
                 "speed": pick_float(item, ["sog", "speed", "spd", "knots"], 0.0),
-                "lat": pick_float(item, ["lat", "latitude", "la", "vslLat"], 0.0),
-                "lon": pick_float(item, ["lot", "lon", "lng", "longitude", "vslLot"], 0.0),
+                "lat": lat,
+                "lon": lon,
+                "location": simple_area_from_lat_lon(lat, lon),
                 "destination": pick_text(item, ["destination", "dest", "dstn", "etaDest"], "-"),
                 "eta": pick_text(item, ["eta", "etaTime", "arrvTm"], "-"),
             }
 
+    previous_state = read_json(AIS_SHIP_STATE_FILE, {})
+    new_state = dict(previous_state) if isinstance(previous_state, dict) else {}
+
     sent = []
     skipped = []
     errors = []
+    event_results = []
 
     for ship_name, info in detected_ships.items():
         target_tokens = tokens_for_ship(ship_name)
         if not target_tokens:
             continue
 
-        can_send, reason = should_send_ais_alert(ship_name, "ais_detected", force=force)
-        if not can_send:
-            skipped.append({"shipName": ship_name, "reason": reason})
-            continue
+        current_snapshot = build_ship_snapshot(ship_name, info)
+        previous_snapshot = previous_state.get(ship_name) if isinstance(previous_state, dict) else None
+        if not isinstance(previous_snapshot, dict):
+            previous_snapshot = None
 
-        title = f"🚢 {ship_name} AIS 감지"
-        body = f"{ship_name} 선박이 울산항 AIS에서 감지되었습니다."
+        ship_events = detect_ship_events(ship_name, current_snapshot, previous_snapshot, force=force)
 
-        result = send_fcm_to_tokens(
-            target_tokens,
-            title,
-            body,
-            {
-                "source": "ulsan_ais_fcm_server",
-                "eventType": "ais_detected_auto" if source == "auto" else "ais_detected_once",
+        for event in ship_events:
+            event_type = event["eventType"]
+            can_send, reason = should_send_ais_alert(ship_name, event_type, force=force)
+            if not can_send:
+                skipped.append({"shipName": ship_name, "eventType": event_type, "reason": reason})
+                continue
+
+            result = send_fcm_to_tokens(
+                target_tokens,
+                event["title"],
+                event["body"],
+                {
+                    "source": "ulsan_ais_fcm_server",
+                    "eventType": event_type,
+                    "shipName": ship_name,
+                    "status": str(current_snapshot.get("status", "-")),
+                    "speed": str(current_snapshot.get("speed", 0.0)),
+                    "location": str(current_snapshot.get("location", "위치 확인중")),
+                    "sentAt": now_iso(),
+                },
+            )
+
+            event_results.append({
                 "shipName": ship_name,
-                "status": str(info.get("status", "-")),
-                "speed": str(info.get("speed", 0.0)),
-                "sentAt": now_iso(),
-            },
-        )
+                "eventType": event_type,
+                "title": event["title"],
+                "success": result["success"],
+            })
 
-        if result["success"] > 0:
-            sent.append(ship_name)
-        if result["errors"]:
-            errors.extend(result["errors"])
+            if result["success"] > 0:
+                sent.append({"shipName": ship_name, "eventType": event_type})
+            if result["errors"]:
+                errors.extend(result["errors"])
+
+        # 감지된 선박은 현재 상태를 저장합니다.
+        new_state[ship_name] = current_snapshot
+
+    # 이번 AIS에서 사라진 감시선박도 상태에는 남겨두되, 24시간 이상 오래된 상태는 정리합니다.
+    now_dt = datetime.now(timezone.utc)
+    cleaned_state = {}
+    for ship_name, snapshot in new_state.items():
+        if not isinstance(snapshot, dict):
+            continue
+        seen_at = parse_iso_time(str(snapshot.get("seenAt", "")))
+        if seen_at is None or (now_dt - seen_at).total_seconds() <= 24 * 3600:
+            cleaned_state[ship_name] = snapshot
+
+    write_json(AIS_SHIP_STATE_FILE, cleaned_state)
 
     result_payload = {
         "ok": True,
@@ -615,6 +782,8 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
         "aisCount": len(ais_list),
         "detectedCount": len(detected_ships),
         "detectedShips": sorted(detected_ships.keys()),
+        "eventCount": len(event_results),
+        "events": event_results,
         "sentShips": sent,
         "skippedShips": skipped,
         "force": force,
@@ -625,13 +794,12 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
 
     history = read_json(EVENT_FILE, [])
     history.insert(0, {
-        "type": "check_ais_auto" if source == "auto" else "check_ais_once",
+        "type": "check_ais_state_change" if source == "auto" else "check_ais_once_state_change",
         **result_payload,
     })
     write_json(EVENT_FILE, history[:200])
 
     return result_payload
-
 
 @app.post("/check-ais-once")
 def check_ais_once():
@@ -821,6 +989,20 @@ def watch_status():
         "ok": True,
         "ships": my_ships,
         **summary,
+        "time": now_iso(),
+    })
+
+
+@app.get("/ais-state")
+def ais_state():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    state = read_json(AIS_SHIP_STATE_FILE, {})
+    return jsonify({
+        "ok": True,
+        "stateCount": len(state) if isinstance(state, dict) else 0,
+        "state": state if isinstance(state, dict) else {},
         "time": now_iso(),
     })
 
