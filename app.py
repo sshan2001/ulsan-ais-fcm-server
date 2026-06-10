@@ -275,7 +275,90 @@ def send_test():
     })
     write_json(EVENT_FILE, history[:200])
     return jsonify({"ok": True, "requested": len(target_tokens), "success": success, "errors": errors[:5]})
+    
+@app.post("/test-ship-alert")
+def test_ship_alert():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+    if not firebase_ready:
+        return jsonify({"ok": False, "error": "firebase not ready", "firebaseError": firebase_error}), 500
 
+    payload = request.get_json(silent=True) or {}
+    ship_name = str(payload.get("shipName", "")).strip().upper()
+    title = str(payload.get("title", f"🚢 {ship_name} 감시 알림"))
+    body = str(payload.get("body", f"{ship_name} 테스트 선박 이벤트가 발생했습니다."))
+
+    if not ship_name:
+        return jsonify({"ok": False, "error": "shipName is required"}), 400
+
+    watch = read_json(WATCH_FILE, {})
+    target_tokens = []
+
+    for token, item in watch.items():
+        ships = unique_ship_list(item.get("ships", [])) if isinstance(item, dict) else []
+        if ship_name in ships:
+            target_tokens.append(token)
+
+    if not target_tokens:
+        return jsonify({
+            "ok": False,
+            "error": "no watchers for this ship",
+            "shipName": ship_name,
+            "targetCount": 0,
+        }), 404
+
+    success = 0
+    errors = []
+
+    for token in target_tokens:
+        try:
+            msg = messaging.Message(
+                token=token,
+                notification=messaging.Notification(
+                    title=title,
+                    body=body,
+                ),
+                data={
+                    "source": "ulsan_ais_fcm_server",
+                    "eventType": "ship_test_alert",
+                    "shipName": ship_name,
+                    "sentAt": now_iso(),
+                },
+                android=messaging.AndroidConfig(
+                    priority="high",
+                    notification=messaging.AndroidNotification(
+                        sound="default",
+                    ),
+                ),
+            )
+            message_id = messaging.send(msg)
+            print(f"SHIP ALERT FCM SUCCESS ship={ship_name} message={message_id}")
+            success += 1
+        except Exception as exc:
+            print(f"SHIP ALERT FCM ERROR ship={ship_name} error={exc}")
+            errors.append(str(exc))
+
+    history = read_json(EVENT_FILE, [])
+    history.insert(0, {
+        "type": "ship_test_alert",
+        "shipName": ship_name,
+        "title": title,
+        "body": body,
+        "targetCount": len(target_tokens),
+        "success": success,
+        "errors": errors[:5],
+        "time": now_iso(),
+    })
+    write_json(EVENT_FILE, history[:200])
+
+    return jsonify({
+        "ok": True,
+        "shipName": ship_name,
+        "targetCount": len(target_tokens),
+        "success": success,
+        "errors": errors[:5],
+        "time": now_iso(),
+    })
 
 @app.post("/register-watch")
 def register_watch():
