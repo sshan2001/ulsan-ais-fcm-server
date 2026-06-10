@@ -2,6 +2,7 @@ import json
 import os
 import time
 import requests
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -29,6 +30,8 @@ EVENT_FILE = DATA_DIR / "event_history.json"
 AIS_ALERT_FILE = DATA_DIR / "ais_alert_state.json"
 
 AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "30"))
+AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
+AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "300"))
 
 SERVER_API_KEY = os.environ.get("SERVER_API_KEY", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -36,6 +39,11 @@ FIREBASE_SERVICE_ACCOUNT_FILE = os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE", 
 
 firebase_ready = False
 firebase_error = ""
+
+auto_checker_started = False
+auto_checker_last_run = ""
+auto_checker_last_result: Dict[str, Any] = {}
+auto_checker_run_count = 0
 
 
 def now_iso() -> str:
@@ -318,11 +326,15 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "2.9.11",
+        "version": "2.9.12",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
         "tokenCount": len(tokens),
+        "autoCheckEnabled": AUTO_CHECK_ENABLED,
+        "autoCheckIntervalSeconds": AUTO_CHECK_INTERVAL_SECONDS,
+        "autoCheckStarted": auto_checker_started,
+        "autoCheckLastRun": auto_checker_last_run,
         **summary,
         "time": now_iso(),
     })
@@ -499,15 +511,20 @@ def test_ship_alert():
     })
 
 
-@app.post("/check-ais-once")
-def check_ais_once():
-    if not require_api_key():
-        return jsonify({"ok": False, "error": "invalid api key"}), 401
-    if not firebase_ready:
-        return jsonify({"ok": False, "error": "firebase not ready", "firebaseError": firebase_error}), 500
 
-    payload = request.get_json(silent=True) or {}
-    force = bool(payload.get("force", False))
+def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[str, Any]:
+    """
+    UPA AIS를 1회 조회하고, watchlist에 등록된 선박이 감지되면 해당 사용자에게만 FCM을 발송합니다.
+    force=True이면 중복방지 쿨다운을 무시합니다.
+    """
+    if not firebase_ready:
+        return {
+            "ok": False,
+            "error": "firebase not ready",
+            "firebaseError": firebase_error,
+            "source": source,
+            "time": now_iso(),
+        }
 
     watch = read_json(WATCH_FILE, {})
     watched_ships = set()
@@ -517,17 +534,24 @@ def check_ais_once():
         watched_ships.update(ships)
 
     if not watched_ships:
-        return jsonify({"ok": False, "error": "no watched ships", "watchedCount": 0}), 404
+        return {
+            "ok": False,
+            "error": "no watched ships",
+            "watchedCount": 0,
+            "source": source,
+            "time": now_iso(),
+        }
 
     try:
         ais_list = fetch_upa_ais_list()
     except Exception as exc:
-        return jsonify({
+        return {
             "ok": False,
             "error": "ais fetch failed",
             "detail": str(exc),
+            "source": source,
             "time": now_iso(),
-        }), 500
+        }
 
     detected_ships = {}
     for item in ais_list:
@@ -547,6 +571,7 @@ def check_ais_once():
     sent = []
     skipped = []
     errors = []
+
     for ship_name, info in detected_ships.items():
         target_tokens = tokens_for_ship(ship_name)
         if not target_tokens:
@@ -566,7 +591,7 @@ def check_ais_once():
             body,
             {
                 "source": "ulsan_ais_fcm_server",
-                "eventType": "ais_detected_once",
+                "eventType": "ais_detected_auto" if source == "auto" else "ais_detected_once",
                 "shipName": ship_name,
                 "status": str(info.get("status", "-")),
                 "speed": str(info.get("speed", 0.0)),
@@ -579,23 +604,9 @@ def check_ais_once():
         if result["errors"]:
             errors.extend(result["errors"])
 
-    history = read_json(EVENT_FILE, [])
-    history.insert(0, {
-        "type": "check_ais_once",
-        "watchedCount": len(watched_ships),
-        "detectedCount": len(detected_ships),
-        "detectedShips": sorted(detected_ships.keys()),
-        "sentShips": sent,
-        "skippedShips": skipped,
-        "force": force,
-        "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
-        "errors": errors[:5],
-        "time": now_iso(),
-    })
-    write_json(EVENT_FILE, history[:200])
-
-    return jsonify({
+    result_payload = {
         "ok": True,
+        "source": source,
         "watchedCount": len(watched_ships),
         "aisCount": len(ais_list),
         "detectedCount": len(detected_ships),
@@ -606,7 +617,97 @@ def check_ais_once():
         "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
         "errors": errors[:5],
         "time": now_iso(),
+    }
+
+    history = read_json(EVENT_FILE, [])
+    history.insert(0, {
+        "type": "check_ais_auto" if source == "auto" else "check_ais_once",
+        **result_payload,
     })
+    write_json(EVENT_FILE, history[:200])
+
+    return result_payload
+
+
+@app.post("/check-ais-once")
+def check_ais_once():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    force = bool(payload.get("force", False))
+
+    result = perform_ais_check_once(force=force, source="manual")
+    status = 200 if result.get("ok") else 500
+    if result.get("error") == "no watched ships":
+        status = 404
+    return jsonify(result), status
+
+
+@app.get("/auto-check-status")
+def auto_check_status():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    return jsonify({
+        "ok": True,
+        "autoCheckEnabled": AUTO_CHECK_ENABLED,
+        "autoCheckStarted": auto_checker_started,
+        "autoCheckIntervalSeconds": AUTO_CHECK_INTERVAL_SECONDS,
+        "autoCheckLastRun": auto_checker_last_run,
+        "autoCheckRunCount": auto_checker_run_count,
+        "autoCheckLastResult": auto_checker_last_result,
+        "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
+        "time": now_iso(),
+    })
+
+
+def auto_checker_loop() -> None:
+    global auto_checker_last_run, auto_checker_last_result, auto_checker_run_count
+
+    print(f"AUTO CHECKER LOOP START enabled={AUTO_CHECK_ENABLED} interval={AUTO_CHECK_INTERVAL_SECONDS}s")
+
+    # 서버 부팅 직후 앱 토큰/감시목록 등록 시간을 조금 기다립니다.
+    time.sleep(20)
+
+    while True:
+        try:
+            init_firebase()
+            auto_checker_last_run = now_iso()
+            auto_checker_run_count += 1
+            result = perform_ais_check_once(force=False, source="auto")
+            auto_checker_last_result = result
+            print(f"AUTO CHECK RESULT: {result}")
+        except Exception as exc:
+            auto_checker_last_run = now_iso()
+            auto_checker_last_result = {
+                "ok": False,
+                "error": str(exc),
+                "source": "auto",
+                "time": now_iso(),
+            }
+            print(f"AUTO CHECK ERROR: {exc}")
+
+        time.sleep(max(60, AUTO_CHECK_INTERVAL_SECONDS))
+
+
+def start_auto_checker() -> None:
+    global auto_checker_started
+
+    if auto_checker_started:
+        return
+
+    if not AUTO_CHECK_ENABLED:
+        print("AUTO CHECKER DISABLED")
+        return
+
+    auto_checker_started = True
+    thread = threading.Thread(target=auto_checker_loop, daemon=True)
+    thread.start()
+    print("AUTO CHECKER THREAD STARTED")
+
+
+start_auto_checker()
 
 
 @app.post("/register-watch")
