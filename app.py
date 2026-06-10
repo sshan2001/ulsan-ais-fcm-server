@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -11,7 +12,7 @@ from flask_cors import CORS
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
-except Exception:  # Render build 전에 로컬 문법 확인용
+except Exception:
     firebase_admin = None
     credentials = None
     messaging = None
@@ -21,6 +22,7 @@ CORS(app)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/ulsan_fcm_server"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 TOKENS_FILE = DATA_DIR / "tokens.json"
 WATCH_FILE = DATA_DIR / "watchlist.json"
 EVENT_FILE = DATA_DIR / "event_history.json"
@@ -76,22 +78,11 @@ def unique_ship_list(values: Any) -> List[str]:
 
 
 def watch_summary(watch: Dict[str, Any], token: str = "", ship_name: str = "") -> Dict[str, Any]:
-    """
-    watch 구조:
-    {
-      "FCM_TOKEN_A": {
-        "ships": ["BOW EXCELLENCE", "KEOYOUNG SUN3"],
-        "updatedAt": "..."
-      }
-    }
-    """
     total_watch_devices = len(watch)
-
     total_watch_links = 0
     total_watch_ships_set = set()
     my_watch_count = 0
     ship_watch_device_count = 0
-
     normalized_ship = normalize_ship_name(ship_name)
 
     for device_token, item in watch.items():
@@ -106,11 +97,11 @@ def watch_summary(watch: Dict[str, Any], token: str = "", ship_name: str = "") -
             ship_watch_device_count += 1
 
     return {
-        "watchDeviceCount": total_watch_devices,              # 감시 등록된 기기 수
-        "totalWatchShips": len(total_watch_ships_set),        # 전체 서버에서 감시 중인 고유 선박 수
-        "totalWatchLinks": total_watch_links,                 # 기기-선박 연결 총합
-        "myWatchCount": my_watch_count,                       # 현재 휴대폰이 감시 중인 선박 수
-        "shipWatchDeviceCount": ship_watch_device_count,      # 해당 선박을 감시 중인 기기 수
+        "watchDeviceCount": total_watch_devices,
+        "totalWatchShips": len(total_watch_ships_set),
+        "totalWatchLinks": total_watch_links,
+        "myWatchCount": my_watch_count,
+        "shipWatchDeviceCount": ship_watch_device_count,
     }
 
 
@@ -118,13 +109,16 @@ def init_firebase() -> None:
     global firebase_ready, firebase_error
     if firebase_ready:
         return
+
     if firebase_admin is None:
         firebase_error = "firebase_admin 패키지를 import하지 못했습니다. requirements.txt를 확인하세요."
         return
+
     try:
         if firebase_admin._apps:
             firebase_ready = True
             return
+
         if FIREBASE_SERVICE_ACCOUNT_JSON:
             info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
             cred = credentials.Certificate(info)
@@ -133,12 +127,135 @@ def init_firebase() -> None:
         else:
             firebase_error = "FIREBASE_SERVICE_ACCOUNT_JSON 환경변수가 없습니다."
             return
+
         firebase_admin.initialize_app(cred)
         firebase_ready = True
         firebase_error = ""
     except Exception as exc:
         firebase_ready = False
         firebase_error = str(exc)
+
+
+def send_fcm_to_tokens(target_tokens: List[str], title: str, body: str, data: Dict[str, str] | None = None) -> Dict[str, Any]:
+    if not firebase_ready:
+        return {
+            "ok": False,
+            "success": 0,
+            "requested": len(target_tokens),
+            "errors": [f"firebase not ready: {firebase_error}"],
+        }
+
+    success = 0
+    errors = []
+
+    for token in target_tokens:
+        try:
+            msg = messaging.Message(
+                token=token,
+                notification=messaging.Notification(title=title, body=body),
+                data=data or {},
+                android=messaging.AndroidConfig(
+                    priority="high",
+                    notification=messaging.AndroidNotification(sound="default"),
+                ),
+            )
+            message_id = messaging.send(msg)
+            print(f"FCM SUCCESS: {message_id}")
+            success += 1
+        except Exception as exc:
+            print(f"FCM ERROR: {exc}")
+            errors.append(str(exc))
+
+    return {
+        "ok": True,
+        "requested": len(target_tokens),
+        "success": success,
+        "errors": errors[:5],
+    }
+
+
+def tokens_for_ship(ship_name: str) -> List[str]:
+    normalized = normalize_ship_name(ship_name)
+    watch = read_json(WATCH_FILE, {})
+    result = []
+
+    for token, item in watch.items():
+        ships = unique_ship_list(item.get("ships", [])) if isinstance(item, dict) else []
+        if normalized in ships:
+            result.append(token)
+
+    return result
+
+
+def fetch_upa_ais_list() -> List[Dict[str, Any]]:
+    url = "https://www.upa.or.kr/abs/cmm/init/getAisListOnTheMap.do"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.upa.or.kr/abs/main/mainPage.do",
+        "Origin": "https://www.upa.or.kr",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    data = {
+        "bookmarkYn": "N",
+        "north": "35.750000",
+        "south": "35.150000",
+        "east": "129.750000",
+        "west": "129.050000",
+    }
+
+    response = requests.post(url, headers=headers, data=data, timeout=15)
+    response.raise_for_status()
+    decoded = response.json()
+
+    if isinstance(decoded, list):
+        return [item for item in decoded if isinstance(item, dict)]
+
+    if isinstance(decoded, dict):
+        raw_list = (
+            decoded.get("vsslList")
+            or decoded.get("ships")
+            or decoded.get("data")
+            or decoded.get("items")
+            or decoded.get("vessels")
+            or []
+        )
+        if isinstance(raw_list, list):
+            return [item for item in raw_list if isinstance(item, dict)]
+
+    return []
+
+
+def pick_ship_name(item: Dict[str, Any]) -> str:
+    return normalize_ship_name(
+        item.get("aisVsslNm")
+        or item.get("vsslNm")
+        or item.get("shipName")
+        or item.get("name")
+        or item.get("vslNm")
+        or item.get("vesselName")
+        or item.get("vsl_eng_nm")
+        or ""
+    )
+
+
+def pick_text(item: Dict[str, Any], keys: List[str], default: str = "-") -> str:
+    for key in keys:
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def pick_float(item: Dict[str, Any], keys: List[str], default: float = 0.0) -> float:
+    for key in keys:
+        value = item.get(key)
+        try:
+            if value is not None and str(value).strip():
+                return float(str(value).strip())
+        except Exception:
+            continue
+    return default
 
 
 @app.before_request
@@ -153,7 +270,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "2.9.8",
+        "version": "2.9.10",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -186,6 +303,7 @@ def register_token():
     tokens: List[Dict[str, Any]] = read_json(TOKENS_FILE, [])
     now = now_iso()
     found = False
+
     for item in tokens:
         if item.get("token") == token:
             item.update({
@@ -197,6 +315,7 @@ def register_token():
             })
             found = True
             break
+
     if not found:
         tokens.append({
             "token": token,
@@ -207,6 +326,7 @@ def register_token():
             "createdAt": now,
             "lastSeenAt": now,
         })
+
     write_json(TOKENS_FILE, tokens)
     return jsonify({"ok": True, "registered": True, "tokenCount": len(tokens), "time": now})
 
@@ -235,47 +355,40 @@ def send_test():
         target_tokens = [token]
     else:
         stored = read_json(TOKENS_FILE, [])
-        target_tokens = [str(item.get("token", "")).strip() for item in stored if str(item.get("token", "")).strip()]
+        target_tokens = [
+            str(item.get("token", "")).strip()
+            for item in stored
+            if str(item.get("token", "")).strip()
+        ]
 
     if not target_tokens:
         return jsonify({"ok": False, "error": "no tokens registered"}), 400
 
-    success = 0
-    errors = []
-    for t in target_tokens:
-        try:
-            msg = messaging.Message(
-                token=t,
-                notification=messaging.Notification(title=title, body=body),
-                data={
-                    "source": "ulsan_ais_fcm_server",
-                    "eventType": "test",
-                    "sentAt": now_iso(),
-                },
-                android=messaging.AndroidConfig(
-                    priority="high",
-                    notification=messaging.AndroidNotification(sound="default"),
-                ),
-            )
-            message_id = messaging.send(msg)
-            print(f"FCM SUCCESS: {message_id}")
-            success += 1
-        except Exception as exc:
-            print(f"FCM ERROR: {exc}")
-            errors.append(str(exc))
+    result = send_fcm_to_tokens(
+        target_tokens,
+        title,
+        body,
+        {
+            "source": "ulsan_ais_fcm_server",
+            "eventType": "test",
+            "sentAt": now_iso(),
+        },
+    )
 
     history = read_json(EVENT_FILE, [])
     history.insert(0, {
         "type": "test",
         "title": title,
         "body": body,
-        "success": success,
-        "errors": errors[:5],
+        "success": result["success"],
+        "errors": result["errors"],
         "time": now_iso(),
     })
     write_json(EVENT_FILE, history[:200])
-    return jsonify({"ok": True, "requested": len(target_tokens), "success": success, "errors": errors[:5]})
-    
+
+    return jsonify(result)
+
+
 @app.post("/test-ship-alert")
 def test_ship_alert():
     if not require_api_key():
@@ -284,20 +397,14 @@ def test_ship_alert():
         return jsonify({"ok": False, "error": "firebase not ready", "firebaseError": firebase_error}), 500
 
     payload = request.get_json(silent=True) or {}
-    ship_name = str(payload.get("shipName", "")).strip().upper()
+    ship_name = normalize_ship_name(payload.get("shipName", ""))
     title = str(payload.get("title", f"🚢 {ship_name} 감시 알림"))
     body = str(payload.get("body", f"{ship_name} 테스트 선박 이벤트가 발생했습니다."))
 
     if not ship_name:
         return jsonify({"ok": False, "error": "shipName is required"}), 400
 
-    watch = read_json(WATCH_FILE, {})
-    target_tokens = []
-
-    for token, item in watch.items():
-        ships = unique_ship_list(item.get("ships", [])) if isinstance(item, dict) else []
-        if ship_name in ships:
-            target_tokens.append(token)
+    target_tokens = tokens_for_ship(ship_name)
 
     if not target_tokens:
         return jsonify({
@@ -307,36 +414,19 @@ def test_ship_alert():
             "targetCount": 0,
         }), 404
 
-    success = 0
-    errors = []
+    result = send_fcm_to_tokens(
+        target_tokens,
+        title,
+        body,
+        {
+            "source": "ulsan_ais_fcm_server",
+            "eventType": "ship_test_alert",
+            "shipName": ship_name,
+            "sentAt": now_iso(),
+        },
+    )
 
-    for token in target_tokens:
-        try:
-            msg = messaging.Message(
-                token=token,
-                notification=messaging.Notification(
-                    title=title,
-                    body=body,
-                ),
-                data={
-                    "source": "ulsan_ais_fcm_server",
-                    "eventType": "ship_test_alert",
-                    "shipName": ship_name,
-                    "sentAt": now_iso(),
-                },
-                android=messaging.AndroidConfig(
-                    priority="high",
-                    notification=messaging.AndroidNotification(
-                        sound="default",
-                    ),
-                ),
-            )
-            message_id = messaging.send(msg)
-            print(f"SHIP ALERT FCM SUCCESS ship={ship_name} message={message_id}")
-            success += 1
-        except Exception as exc:
-            print(f"SHIP ALERT FCM ERROR ship={ship_name} error={exc}")
-            errors.append(str(exc))
+    print(f"SHIP ALERT result ship={ship_name} result={result}")
 
     history = read_json(EVENT_FILE, [])
     history.insert(0, {
@@ -345,8 +435,8 @@ def test_ship_alert():
         "title": title,
         "body": body,
         "targetCount": len(target_tokens),
-        "success": success,
-        "errors": errors[:5],
+        "success": result["success"],
+        "errors": result["errors"],
         "time": now_iso(),
     })
     write_json(EVENT_FILE, history[:200])
@@ -355,10 +445,106 @@ def test_ship_alert():
         "ok": True,
         "shipName": ship_name,
         "targetCount": len(target_tokens),
-        "success": success,
+        "success": result["success"],
+        "errors": result["errors"],
+        "time": now_iso(),
+    })
+
+
+@app.post("/check-ais-once")
+def check_ais_once():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+    if not firebase_ready:
+        return jsonify({"ok": False, "error": "firebase not ready", "firebaseError": firebase_error}), 500
+
+    watch = read_json(WATCH_FILE, {})
+    watched_ships = set()
+
+    for _, item in watch.items():
+        ships = unique_ship_list(item.get("ships", [])) if isinstance(item, dict) else []
+        watched_ships.update(ships)
+
+    if not watched_ships:
+        return jsonify({"ok": False, "error": "no watched ships", "watchedCount": 0}), 404
+
+    try:
+        ais_list = fetch_upa_ais_list()
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "ais fetch failed",
+            "detail": str(exc),
+            "time": now_iso(),
+        }), 500
+
+    detected_ships = {}
+    for item in ais_list:
+        name = pick_ship_name(item)
+        if name and name in watched_ships:
+            detected_ships[name] = {
+                "name": name,
+                "mmsi": pick_text(item, ["aisMmsi", "mmsi", "MMSI", "mmsiNo"], "-"),
+                "status": pick_text(item, ["oprtlSttsKr", "oprtlStts", "status", "navStatus", "nvgtStts", "state"], "-"),
+                "speed": pick_float(item, ["sog", "speed", "spd", "knots"], 0.0),
+                "lat": pick_float(item, ["lat", "latitude", "la", "vslLat"], 0.0),
+                "lon": pick_float(item, ["lot", "lon", "lng", "longitude", "vslLot"], 0.0),
+                "destination": pick_text(item, ["destination", "dest", "dstn", "etaDest"], "-"),
+                "eta": pick_text(item, ["eta", "etaTime", "arrvTm"], "-"),
+            }
+
+    sent = []
+    errors = []
+    for ship_name, info in detected_ships.items():
+        target_tokens = tokens_for_ship(ship_name)
+        if not target_tokens:
+            continue
+
+        title = f"🚢 {ship_name} AIS 감지"
+        body = f"{ship_name} 선박이 울산항 AIS에서 감지되었습니다."
+
+        result = send_fcm_to_tokens(
+            target_tokens,
+            title,
+            body,
+            {
+                "source": "ulsan_ais_fcm_server",
+                "eventType": "ais_detected_once",
+                "shipName": ship_name,
+                "status": str(info.get("status", "-")),
+                "speed": str(info.get("speed", 0.0)),
+                "sentAt": now_iso(),
+            },
+        )
+
+        if result["success"] > 0:
+            sent.append(ship_name)
+        if result["errors"]:
+            errors.extend(result["errors"])
+
+    history = read_json(EVENT_FILE, [])
+    history.insert(0, {
+        "type": "check_ais_once",
+        "watchedCount": len(watched_ships),
+        "detectedCount": len(detected_ships),
+        "detectedShips": sorted(detected_ships.keys()),
+        "sentShips": sent,
         "errors": errors[:5],
         "time": now_iso(),
     })
+    write_json(EVENT_FILE, history[:200])
+
+    return jsonify({
+        "ok": True,
+        "watchedCount": len(watched_ships),
+        "aisCount": len(ais_list),
+        "detectedCount": len(detected_ships),
+        "detectedShips": sorted(detected_ships.keys()),
+        "sentShips": sent,
+        "errors": errors[:5],
+        "time": now_iso(),
+    })
+
 
 @app.post("/register-watch")
 def register_watch():
@@ -463,7 +649,6 @@ def watch_status():
 
 @app.get("/alerts/demo")
 def alerts_demo():
-    # 앱의 기존 서버 알림 즉시 확인 기능 테스트용입니다.
     return jsonify({
         "ok": True,
         "alerts": [
