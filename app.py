@@ -329,7 +329,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "2.9.13",
+        "version": "2.9.14",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -1022,6 +1022,23 @@ def alert_history():
         "cooldownCount": len(alert_state) if isinstance(alert_state, dict) else 0,
         "cooldownState": alert_state if isinstance(alert_state, dict) else {},
         "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
+        "time": now_iso(),
+    })
+
+
+@app.post("/clear-alert-history")
+def clear_alert_history():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    write_json(EVENT_FILE, [])
+    write_json(AIS_ALERT_FILE, {})
+    write_json(AIS_SHIP_STATE_FILE, {})
+
+    return jsonify({
+        "ok": True,
+        "cleared": True,
+        "message": "alert history, duplicate state, ais ship state cleared",
         "time": now_iso(),
     })
 
