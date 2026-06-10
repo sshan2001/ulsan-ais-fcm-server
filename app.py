@@ -41,6 +41,7 @@ firebase_ready = False
 firebase_error = ""
 
 auto_checker_started = False
+auto_checker_pid = 0
 auto_checker_last_run = ""
 auto_checker_last_result: Dict[str, Any] = {}
 auto_checker_run_count = 0
@@ -317,6 +318,7 @@ def pick_float(item: Dict[str, Any], keys: List[str], default: float = 0.0) -> f
 @app.before_request
 def before_request() -> None:
     init_firebase()
+    ensure_auto_checker_running()
 
 
 @app.get("/")
@@ -326,7 +328,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "2.9.12",
+        "version": "2.9.12-fixed",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -334,6 +336,8 @@ def index():
         "autoCheckEnabled": AUTO_CHECK_ENABLED,
         "autoCheckIntervalSeconds": AUTO_CHECK_INTERVAL_SECONDS,
         "autoCheckStarted": auto_checker_started,
+        "autoCheckPid": auto_checker_pid,
+        "currentPid": os.getpid(),
         "autoCheckLastRun": auto_checker_last_run,
         **summary,
         "time": now_iso(),
@@ -653,6 +657,8 @@ def auto_check_status():
         "ok": True,
         "autoCheckEnabled": AUTO_CHECK_ENABLED,
         "autoCheckStarted": auto_checker_started,
+        "autoCheckPid": auto_checker_pid,
+        "currentPid": os.getpid(),
         "autoCheckIntervalSeconds": AUTO_CHECK_INTERVAL_SECONDS,
         "autoCheckLastRun": auto_checker_last_run,
         "autoCheckRunCount": auto_checker_run_count,
@@ -691,23 +697,31 @@ def auto_checker_loop() -> None:
         time.sleep(max(60, AUTO_CHECK_INTERVAL_SECONDS))
 
 
-def start_auto_checker() -> None:
-    global auto_checker_started
-
-    if auto_checker_started:
-        return
+def ensure_auto_checker_running() -> None:
+    """
+    Gunicorn/Render 환경에서는 앱 import 시점과 실제 worker 실행 시점이 달라질 수 있습니다.
+    그래서 요청이 들어올 때마다 현재 프로세스(pid) 안에서 자동감시 스레드가 살아있도록 보장합니다.
+    """
+    global auto_checker_started, auto_checker_pid
 
     if not AUTO_CHECK_ENABLED:
-        print("AUTO CHECKER DISABLED")
+        return
+
+    current_pid = os.getpid()
+
+    if auto_checker_started and auto_checker_pid == current_pid:
         return
 
     auto_checker_started = True
+    auto_checker_pid = current_pid
+
     thread = threading.Thread(target=auto_checker_loop, daemon=True)
     thread.start()
-    print("AUTO CHECKER THREAD STARTED")
+    print(f"AUTO CHECKER THREAD STARTED pid={current_pid}")
 
 
-start_auto_checker()
+def start_auto_checker() -> None:
+    ensure_auto_checker_running()
 
 
 @app.post("/register-watch")
