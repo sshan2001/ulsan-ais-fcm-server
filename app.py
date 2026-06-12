@@ -35,7 +35,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "300"))
 
-# 3.1.0 특수 이벤트/이벤트 흐름 설정
+# 3.1.1 항로 좌표 판정/이벤트 흐름 설정
 # 일반 이벤트는 AIS_ALERT_COOLDOWN_MINUTES(기본 30분) 쿨다운을 유지합니다.
 # 아래 특수 이벤트는 30분 쿨다운을 무시하고,
 # 선박 + 구역 + 단계 기준으로 1회씩 발송합니다.
@@ -381,7 +381,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.1.0-event-flow-clean",
+        "version": "3.1.1-fairway-routes",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -1093,6 +1093,84 @@ def berth_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
     }
 
 
+# 3.1.1 울산항 항로 좌표 기반 판정
+# 사용자가 제공한 제1항로/제2항로/제3항로 경계 좌표를 polygon으로 등록합니다.
+# 최종 구역 우선순위에서는 묘박지/부이/부두 다음에 항로를 판정합니다.
+# 즉, 선박이 부두나 묘박지 안에 있으면 그 구역을 우선 표시하고,
+# 그렇지 않은 상태에서 항로 안에 있으면 "제1항로"처럼 표시합니다.
+FAIRWAY_AREAS = [
+    {
+        "name": "제1항로",
+        "description": "울산항 진입 메인 항로",
+        "coords": [
+            (35.40305556, 129.41805556),
+            (35.46638889, 129.39422222),
+            (35.49116667, 129.39197222),
+            (35.51388889, 129.38905556),
+            (35.51477778, 129.39230556),
+            (35.49269444, 129.39513889),
+            (35.46638889, 129.39963889),
+            (35.40305556, 129.42416667),
+        ],
+    },
+    {
+        "name": "제2항로",
+        "description": "울산본항/내항 연결 항로",
+        "coords": [
+            (35.49116667, 129.39197222),
+            (35.49563889, 129.38836111),
+            (35.50055556, 129.37883333),
+            (35.50222222, 129.37938889),
+            (35.49852778, 129.38880556),
+            (35.49975000, 129.39086111),
+        ],
+    },
+    {
+        "name": "제3항로",
+        "description": "온산/신항 방면 연결 항로",
+        "coords": [
+            (35.43750000, 129.40527778),
+            (35.44388889, 129.39638889),
+            (35.44822222, 129.37294444),
+            (35.45072222, 129.37422222),
+            (35.44888889, 129.39555556),
+            (35.45166667, 129.39972222),
+        ],
+    },
+]
+
+
+def fairway_zone_from_lat_lon(lat: float, lon: float) -> str | None:
+    if lat == 0 or lon == 0:
+        return None
+
+    for area in FAIRWAY_AREAS:
+        if point_in_polygon(lat, lon, area["coords"]):
+            return str(area["name"])
+
+    return None
+
+
+def fairway_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
+    zone = fairway_zone_from_lat_lon(lat, lon)
+    distances = []
+    for area in FAIRWAY_AREAS:
+        center_lat, center_lon = _polygon_center(area["coords"])
+        distances.append({
+            "name": area["name"],
+            "description": area.get("description", ""),
+            "centerLat": round(center_lat, 6),
+            "centerLon": round(center_lon, 6),
+            "distanceKm": round(_distance_km(lat, lon, center_lat, center_lon), 3),
+            "inside": point_in_polygon(lat, lon, area["coords"]),
+        })
+    distances.sort(key=lambda item: item["distanceKm"])
+    return {
+        "zone": zone,
+        "nearest": distances[:3],
+    }
+
+
 def resolve_zone_decision(lat: float, lon: float) -> Dict[str, Any]:
     """
     3.0.9 좌표 기반 최종 구역 판정 우선순위.
@@ -1100,7 +1178,8 @@ def resolve_zone_decision(lat: float, lon: float) -> Dict[str, Any]:
     1순위: M/E 묘박지
     2순위: SK/S-OIL 부이
     3순위: 모든 부두 중 가장 가까운 부두 1개
-    4순위: 넓은 해역/접근/항내 구역
+    4순위: 제1항로/제2항로/제3항로
+    5순위: 넓은 해역/접근/항내 구역
 
     이 함수의 selectedZone이 실제 알림 location/eventType 구역명에 사용됩니다.
     """
@@ -1119,13 +1198,17 @@ def resolve_zone_decision(lat: float, lon: float) -> Dict[str, Any]:
     if berth_zone:
         return {"selectedZone": berth_zone, "zoneType": "berth", "priority": 3}
 
+    fairway_zone = fairway_zone_from_lat_lon(lat, lon)
+    if fairway_zone:
+        return {"selectedZone": fairway_zone, "zoneType": "route", "priority": 4}
+
     if lat >= 35.48 and lon >= 129.42:
-        return {"selectedZone": "외항/동측 해역", "zoneType": "broad_area", "priority": 4}
+        return {"selectedZone": "외항/동측 해역", "zoneType": "broad_area", "priority": 5}
     if lat >= 35.43 and lon >= 129.35:
-        return {"selectedZone": "울산항 접근 해역", "zoneType": "broad_area", "priority": 4}
+        return {"selectedZone": "울산항 접근 해역", "zoneType": "broad_area", "priority": 5}
     if lat >= 35.37 and lon >= 129.33:
-        return {"selectedZone": "울산항 항내/부두권", "zoneType": "broad_area", "priority": 4}
-    return {"selectedZone": "울산항 인근", "zoneType": "broad_area", "priority": 4}
+        return {"selectedZone": "울산항 항내/부두권", "zoneType": "broad_area", "priority": 5}
+    return {"selectedZone": "울산항 인근", "zoneType": "broad_area", "priority": 5}
 
 
 def simple_area_from_lat_lon(lat: float, lon: float) -> str:
@@ -1944,7 +2027,7 @@ def clear_alert_history():
 def zone_test():
     """
     서버 좌표 판정 테스트용 엔드포인트.
-    예: /zone-test?lat=35.4388&lon=129.3934
+    예: /zone-test?lat=35.46638889&lon=129.39422222
     """
     if not require_api_key():
         return jsonify({"ok": False, "error": "invalid api key"}), 401
@@ -1958,7 +2041,7 @@ def zone_test():
         return jsonify({
             "ok": False,
             "error": "lat and lon query parameters are required",
-            "example": "/zone-test?lat=35.4388&lon=129.3934",
+            "example": "/zone-test?lat=35.46638889&lon=129.39422222",
             "time": now_iso(),
         }), 400
 
@@ -1967,6 +2050,7 @@ def zone_test():
     main_berth_debug = main_berth_debug_payload(lat_f, lon_f)
     other_berth_debug = other_berth_debug_payload(lat_f, lon_f)
     berth_debug = berth_debug_payload(lat_f, lon_f)
+    fairway_debug = fairway_debug_payload(lat_f, lon_f)
     decision = resolve_zone_decision(lat_f, lon_f)
     return jsonify({
         "ok": True,
@@ -1976,7 +2060,7 @@ def zone_test():
         "selectedZone": decision["selectedZone"],
         "selectedZoneType": decision["zoneType"],
         "selectedPriority": decision["priority"],
-        "priorityRule": "1 anchorage > 2 buoy > 3 nearest berth > 4 broad area",
+        "priorityRule": "1 anchorage > 2 buoy > 3 nearest berth > 4 fairway route > 5 broad area",
         "anchorageZone": anchorage_debug["zone"],
         "nearestAnchorages": anchorage_debug["nearest"],
         "buoyZone": buoy_debug["zone"],
@@ -1984,6 +2068,8 @@ def zone_test():
         "berthZone": berth_debug["zone"],
         "nearestBerths": berth_debug["nearest"],
         "selectedBerth": berth_debug["selected"],
+        "fairwayZone": fairway_debug["zone"],
+        "nearestFairways": fairway_debug["nearest"],
         "mainBerthZone": main_berth_debug["zone"],
         "nearestMainBerths": main_berth_debug["nearest"],
         "otherBerthZone": other_berth_debug["zone"],
