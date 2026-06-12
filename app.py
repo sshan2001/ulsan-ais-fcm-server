@@ -34,7 +34,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "300"))
 
-# 3.0.2 특수 이벤트 설정
+# 3.0.3 특수 이벤트 설정
 # 일반 이벤트는 AIS_ALERT_COOLDOWN_MINUTES(기본 30분) 쿨다운을 유지합니다.
 # 아래 특수 이벤트는 30분 쿨다운을 무시하고,
 # 선박 + 구역 + 단계 기준으로 1회씩 발송합니다.
@@ -380,7 +380,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.0.2-special-berth-anchorage",
+        "version": "3.0.3-special-event-clean",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -673,10 +673,17 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
     """
     이전 AIS 상태와 현재 AIS 상태를 비교해서 발송할 이벤트 목록을 만듭니다.
 
-    3.0.2 핵심 변경:
+    3.0.3 핵심 변경:
     - 일반 이벤트는 기존 30분 쿨다운 유지
-    - 부두 접안중 / 부두 접안완료 / 묘박지 투묘중 / 묘박지 투묘완료는 특수 이벤트로 분리
-    - 특수 이벤트는 30분 쿨다운과 별개로 같은 선박 + 같은 구역 + 같은 단계 기준 1회씩 발송
+    - 특수 이벤트는 30분 쿨다운 예외
+    - 특수 이벤트는 선박 + 구역 + 단계 기준 1회만 발송
+    - 부두 접안중 / 부두 접안완료 / M/E 묘지 투묘중 / M/E 묘지 투묘완료를 분리
+
+    특수 이벤트 조건:
+    - 부두 접안중: 부두권 + 0.5~1.0kn
+    - 부두 접안완료: 부두권 + 0.1kn 이하 + 정박/MOORED/접안 계열 상태
+    - 묘지 투묘중: M/E 묘지/정박지 + 0.5~1.5kn
+    - 묘지 투묘완료: M/E 묘지/정박지 + 0.1kn 이하
     """
     events: List[Dict[str, str]] = []
     name = normalize_ship_name(ship_name)
@@ -685,17 +692,18 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
     current_speed = float(current.get("speed", 0.0) or 0.0)
     current_location = str(current.get("location", "위치 확인중"))
 
-    if previous is None:
+    has_previous = isinstance(previous, dict)
+
+    if not has_previous:
         events.append({
             "eventType": "ais_first_detected",
             "title": f"🚢 {name} AIS 최초 감지",
             "body": f"{name} 선박이 울산항 AIS에서 처음 감지되었습니다. 위치: {current_location}",
         })
-        return events
 
-    previous_status = str(previous.get("status", "-"))
-    previous_speed = float(previous.get("speed", 0.0) or 0.0)
-    previous_location = str(previous.get("location", "위치 확인중"))
+    previous_status = str(previous.get("status", "-")) if has_previous else "-"
+    previous_speed = float(previous.get("speed", 0.0) or 0.0) if has_previous else 0.0
+    previous_location = str(previous.get("location", "위치 확인중")) if has_previous else "위치 확인중"
 
     prev_stopped = is_stopped_like(previous_status, previous_speed)
     now_stopped = is_stopped_like(current_status, current_speed)
@@ -709,47 +717,55 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
     berth_zone_id = normalize_zone_id(berth_zone)
     anchorage_zone_id = normalize_zone_id(anchorage_zone)
 
+    current_status_upper = current_status.upper()
+    berth_completed_status = (
+        "MOORED" in current_status_upper
+        or "접안" in current_status
+        or "정박" in current_status
+        or "BERTH" in current_status_upper
+        or "DOCK" in current_status_upper
+    )
+
     special_event_added = False
 
     # 부두 접안중: 부두/선석권에서 0.5~1.0kn 사이로 천천히 접근하는 단계.
-    # 이전 속도가 더 높았거나 이전 위치가 다른 경우에만 의미 있는 단계로 봅니다.
-    if berth_area and 0.5 <= current_speed <= 1.0 and (previous_speed > 1.0 or previous_location != current_location):
+    # 30분 쿨다운과 무관하며, should_send_ais_alert()에서 선박+구역+단계 기준 1회만 발송됩니다.
+    if berth_area and 0.5 <= current_speed <= 1.0:
         events.append({
             "eventType": f"berth_approaching:{berth_zone_id}",
-            "title": f"🚢 {name} 접안중",
+            "title": f"🚢 {name} 부두 접안중",
             "body": f"{name} 선박이 {berth_zone} 근처에서 접안 중으로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
         })
         special_event_added = True
 
-    # 부두 접안완료: 부두/선석권에서 0.1kn 이하 또는 AIS 상태가 접안/정박 계열.
-    if berth_area and (current_speed <= 0.1 or "MOORED" in current_status.upper() or "접안" in current_status or "정박" in current_status):
-        # 이전부터 같은 부두에서 완전히 정지해 있던 경우는 should_send_ais_alert의 특수 이벤트 1회 제한이 막아줍니다.
+    # 부두 접안완료: 부두/선석권 + 0.1kn 이하 + 정박/MOORED/접안 계열 상태.
+    if berth_area and current_speed <= 0.1 and berth_completed_status:
         events.append({
             "eventType": f"berth_completed:{berth_zone_id}",
-            "title": f"⚓ {name} 접안완료",
+            "title": f"⚓ {name} 부두 접안완료",
             "body": f"{name} 선박이 {berth_zone}에서 접안완료 상태로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
         })
         special_event_added = True
 
     # 묘박지 투묘중: M/E 묘지 또는 정박지에서 0.5~1.5kn 사이로 감속/진입하는 단계.
-    if anchorage_area and 0.5 <= current_speed <= 1.5 and (previous_speed > 1.5 or previous_location != current_location):
+    if anchorage_area and 0.5 <= current_speed <= 1.5:
         events.append({
             "eventType": f"anchorage_approaching:{anchorage_zone_id}",
-            "title": f"⚓ {name} 투묘중",
+            "title": f"⚓ {name} 묘지 투묘중",
             "body": f"{name} 선박이 {anchorage_zone}에서 투묘 중으로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
         })
         special_event_added = True
 
-    # 묘박지 투묘완료: M/E 묘지 또는 정박지에서 0.1kn 이하 또는 ANCHOR/정박 계열.
-    if anchorage_area and (current_speed <= 0.1 or "ANCHOR" in current_status.upper() or "묘박" in current_status or "투묘" in current_status or "정박" in current_status):
+    # 묘박지 투묘완료: M/E 묘지 또는 정박지에서 0.1kn 이하.
+    if anchorage_area and current_speed <= 0.1:
         events.append({
             "eventType": f"anchorage_completed:{anchorage_zone_id}",
-            "title": f"⚓ {name} 투묘완료",
+            "title": f"⚓ {name} 묘지 투묘완료",
             "body": f"{name} 선박이 {anchorage_zone}에서 투묘완료 상태로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
         })
         special_event_added = True
 
-    if prev_stopped and now_underway:
+    if has_previous and prev_stopped and now_underway:
         events.append({
             "eventType": "departure_detected",
             "title": f"🔔 {name} 출항 · 이동 시작",
@@ -758,21 +774,21 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
 
     # 특수 접안/투묘 이벤트가 이미 잡힌 경우에는 기존의 포괄적 anchored_or_docked 알림은 생략합니다.
     # 이렇게 해야 '접안중 → 접안완료'처럼 세분화된 알림이 일반 정박 알림에 묻히지 않습니다.
-    if prev_underway and now_stopped and not special_event_added:
+    if has_previous and prev_underway and now_stopped and not special_event_added:
         events.append({
             "eventType": "anchored_or_docked",
             "title": f"⚓ {name} 정박 · 접안 감지",
             "body": f"{name} 선박이 정박 또는 접안 상태로 감지되었습니다. 위치: {current_location}",
         })
 
-    if previous_status != current_status:
+    if has_previous and previous_status != current_status:
         events.append({
             "eventType": f"status_changed:{current_status}",
             "title": f"📡 {name} AIS 상태 변화",
             "body": f"{name} 상태가 {previous_status} → {current_status} 로 변경되었습니다.",
         })
 
-    if previous_location != current_location and current_location != "위치 확인중":
+    if has_previous and previous_location != current_location and current_location != "위치 확인중":
         events.append({
             "eventType": f"location_changed:{current_location}",
             "title": f"📍 {name} 위치 변화",
