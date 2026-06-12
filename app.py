@@ -380,7 +380,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.0.3-special-event-clean",
+        "version": "3.0.4-watch-api-compat",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -828,13 +828,21 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
         watched_ships.update(ships)
 
     if not watched_ships:
-        return {
+        result_payload = {
             "ok": False,
             "error": "no watched ships",
             "watchedCount": 0,
             "source": source,
             "time": now_iso(),
         }
+        # 앱/서버 연동 문제를 알림탭에서 바로 확인할 수 있도록 기록합니다.
+        history = read_json(EVENT_FILE, [])
+        history.insert(0, {
+            "type": "check_ais_no_watched_ships",
+            **result_payload,
+        })
+        write_json(EVENT_FILE, history[:200])
+        return result_payload
 
     try:
         ais_list = fetch_upa_ais_list()
@@ -1147,6 +1155,76 @@ def watch_status():
     return jsonify({
         "ok": True,
         "ships": my_ships,
+        **summary,
+        "time": now_iso(),
+    })
+
+
+def extract_ship_list_from_payload(payload: Dict[str, Any]) -> List[str]:
+    """
+    앱 버전에 따라 감시 선박 목록 키 이름이 달라질 수 있어 여러 이름을 허용합니다.
+    예: ships, shipNames, watchShips, trackedShips
+    """
+    for key in ("ships", "shipNames", "watchShips", "trackedShips", "watchList"):
+        values = payload.get(key)
+        if isinstance(values, list):
+            return unique_ship_list(values)
+    return []
+
+
+@app.route("/my-watch", methods=["GET", "POST"])
+def my_watch():
+    """
+    모바일 앱 호환용 감시목록 엔드포인트입니다.
+
+    현재 앱 로그에서 POST /my-watch 호출이 확인되었는데, 기존 서버에는 이 주소가 없어 404가 발생했습니다.
+    이 엔드포인트는 다음 두 역할을 동시에 처리합니다.
+    1) token만 오면 서버에 저장된 내 감시목록 조회
+    2) token + ships 계열 목록이 같이 오면 서버 감시목록을 복구/동기화
+    """
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    token = (
+        str(payload.get("token", "")).strip()
+        or str(request.args.get("token", "")).strip()
+    )
+
+    watch = read_json(WATCH_FILE, {})
+    if not isinstance(watch, dict):
+        watch = {}
+
+    incoming_ships = extract_ship_list_from_payload(payload)
+    synced = False
+
+    # Render 재배포 후 /tmp 데이터가 비어도 앱이 로컬 SharedPreferences의 선박목록을 보내주면 즉시 복구합니다.
+    if token and incoming_ships:
+        watch[token] = {
+            "ships": incoming_ships,
+            "updatedAt": now_iso(),
+            "source": "my-watch-sync",
+        }
+        write_json(WATCH_FILE, watch)
+        synced = True
+
+    my_ships = []
+    if token and token in watch and isinstance(watch[token], dict):
+        my_ships = unique_ship_list(watch[token].get("ships", []))
+
+    summary = watch_summary(watch, token=token)
+
+    print(
+        f"MY WATCH token={token[:12]}... incoming={incoming_ships} "
+        f"synced={synced} myShips={my_ships} summary={summary}"
+    )
+
+    return jsonify({
+        "ok": True,
+        "synced": synced,
+        "registered": synced,
+        "ships": my_ships,
+        "registeredShips": len(my_ships),
         **summary,
         "time": now_iso(),
     })
