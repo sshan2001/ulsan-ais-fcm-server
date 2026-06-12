@@ -381,7 +381,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.0.8-zone-onsan-mipo-etc",
+        "version": "3.0.9-zone-priority-clean",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -1032,38 +1032,105 @@ def other_berth_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
     }
 
 
-def simple_area_from_lat_lon(lat: float, lon: float) -> str:
+def _nearest_point_zone(lat: float, lon: float, areas: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """
+    반경 기반 구역 목록에서 실제 반경 안에 들어온 후보 중 가장 가까운 1개를 고릅니다.
+    여러 부두/부이가 겹치더라도 최종 알림 문구에는 이 함수가 고른 1개만 사용합니다.
+    """
     if lat == 0 or lon == 0:
-        return "위치 확인중"
+        return None
 
-    # 3.0.5: M1~M7 / E1~E3 묘박지는 가장 먼저 세부 구역명으로 판정합니다.
+    nearest: Dict[str, Any] | None = None
+    nearest_km = 999.0
+
+    for area in areas:
+        try:
+            area_lat = float(area["lat"])
+            area_lon = float(area["lon"])
+            radius_km = float(area["radius_m"]) / 1000.0
+        except Exception:
+            continue
+
+        distance_km = _distance_km(lat, lon, area_lat, area_lon)
+        if distance_km <= radius_km and distance_km < nearest_km:
+            nearest_km = distance_km
+            nearest = dict(area)
+            nearest["distanceKm"] = round(distance_km, 3)
+            nearest["inside"] = True
+
+    return nearest
+
+
+def berth_zone_from_lat_lon(lat: float, lon: float) -> str | None:
+    """
+    본항/온산/신항/미포/현대/KPX 등 모든 부두 후보를 하나로 묶어
+    최종 부두명은 거리 기준으로 가장 가까운 1개만 반환합니다.
+    """
+    berth = _nearest_point_zone(lat, lon, MAIN_BERTH_AREAS + OTHER_BERTH_AREAS)
+    if berth is None:
+        return None
+    return str(berth["name"])
+
+
+def berth_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
+    berth = _nearest_point_zone(lat, lon, MAIN_BERTH_AREAS + OTHER_BERTH_AREAS)
+    distances = []
+    for area in MAIN_BERTH_AREAS + OTHER_BERTH_AREAS:
+        distance_km = _distance_km(lat, lon, float(area["lat"]), float(area["lon"]))
+        distances.append({
+            "name": area["name"],
+            "lat": area["lat"],
+            "lon": area["lon"],
+            "radiusM": area["radius_m"],
+            "distanceKm": round(distance_km, 3),
+            "inside": distance_km <= float(area["radius_m"]) / 1000.0,
+        })
+    distances.sort(key=lambda item: item["distanceKm"])
+    return {
+        "zone": None if berth is None else str(berth["name"]),
+        "selected": berth,
+        "nearest": distances[:10],
+    }
+
+
+def resolve_zone_decision(lat: float, lon: float) -> Dict[str, Any]:
+    """
+    3.0.9 좌표 기반 최종 구역 판정 우선순위.
+
+    1순위: M/E 묘박지
+    2순위: SK/S-OIL 부이
+    3순위: 모든 부두 중 가장 가까운 부두 1개
+    4순위: 넓은 해역/접근/항내 구역
+
+    이 함수의 selectedZone이 실제 알림 location/eventType 구역명에 사용됩니다.
+    """
+    if lat == 0 or lon == 0:
+        return {"selectedZone": "위치 확인중", "zoneType": "unknown", "priority": 0}
+
     anchorage_zone = anchorage_zone_from_lat_lon(lat, lon)
     if anchorage_zone:
-        return anchorage_zone
+        return {"selectedZone": anchorage_zone, "zoneType": "anchorage", "priority": 1}
 
-    # 3.0.6: SK / S-OIL 부이는 묘박지 다음 우선순위로 세부 구역명 판정합니다.
     buoy_zone = buoy_zone_from_lat_lon(lat, lon)
     if buoy_zone:
-        return buoy_zone
+        return {"selectedZone": buoy_zone, "zoneType": "buoy", "priority": 2}
 
-    # 3.0.7: 울산 본항 주요 부두를 좌표 기반으로 세부 판정합니다.
-    main_berth_zone = main_berth_zone_from_lat_lon(lat, lon)
-    if main_berth_zone:
-        return main_berth_zone
+    berth_zone = berth_zone_from_lat_lon(lat, lon)
+    if berth_zone:
+        return {"selectedZone": berth_zone, "zoneType": "berth", "priority": 3}
 
-    # 3.0.8: 온산/신항/미포/현대/KPX/기타 울산항 부두를 세부 판정합니다.
-    other_berth_zone = other_berth_zone_from_lat_lon(lat, lon)
-    if other_berth_zone:
-        return other_berth_zone
-
-    # 울산항 주변의 대략적인 구역명입니다. 세부 부두 기준점 밖의 선박은 기존 넓은 구역명으로 표시합니다.
     if lat >= 35.48 and lon >= 129.42:
-        return "외항/동측 해역"
+        return {"selectedZone": "외항/동측 해역", "zoneType": "broad_area", "priority": 4}
     if lat >= 35.43 and lon >= 129.35:
-        return "울산항 접근 해역"
+        return {"selectedZone": "울산항 접근 해역", "zoneType": "broad_area", "priority": 4}
     if lat >= 35.37 and lon >= 129.33:
-        return "울산항 항내/부두권"
-    return "울산항 인근"
+        return {"selectedZone": "울산항 항내/부두권", "zoneType": "broad_area", "priority": 4}
+    return {"selectedZone": "울산항 인근", "zoneType": "broad_area", "priority": 4}
+
+
+def simple_area_from_lat_lon(lat: float, lon: float) -> str:
+    decision = resolve_zone_decision(lat, lon)
+    return str(decision.get("selectedZone") or "울산항 인근")
 
 
 
@@ -1764,15 +1831,24 @@ def zone_test():
     buoy_debug = buoy_debug_payload(lat_f, lon_f)
     main_berth_debug = main_berth_debug_payload(lat_f, lon_f)
     other_berth_debug = other_berth_debug_payload(lat_f, lon_f)
+    berth_debug = berth_debug_payload(lat_f, lon_f)
+    decision = resolve_zone_decision(lat_f, lon_f)
     return jsonify({
         "ok": True,
         "lat": lat_f,
         "lon": lon_f,
-        "area": simple_area_from_lat_lon(lat_f, lon_f),
+        "area": decision["selectedZone"],
+        "selectedZone": decision["selectedZone"],
+        "selectedZoneType": decision["zoneType"],
+        "selectedPriority": decision["priority"],
+        "priorityRule": "1 anchorage > 2 buoy > 3 nearest berth > 4 broad area",
         "anchorageZone": anchorage_debug["zone"],
         "nearestAnchorages": anchorage_debug["nearest"],
         "buoyZone": buoy_debug["zone"],
         "nearestBuoys": buoy_debug["nearest"],
+        "berthZone": berth_debug["zone"],
+        "nearestBerths": berth_debug["nearest"],
+        "selectedBerth": berth_debug["selected"],
         "mainBerthZone": main_berth_debug["zone"],
         "nearestMainBerths": main_berth_debug["nearest"],
         "otherBerthZone": other_berth_debug["zone"],
