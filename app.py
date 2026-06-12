@@ -381,7 +381,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.0.5-zone-anchor-m-e",
+        "version": "3.0.6-zone-buoy-sk-soil",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -818,6 +818,59 @@ def anchorage_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
         "nearest": distances[:3],
     }
 
+# 3.0.6 SK / S-OIL 부이 좌표 기반 판정
+# 2-2순위 작업 범위입니다.
+# AIS 좌표가 아래 반경 안에 들어오면 "SK_B#2 부이"처럼 세부 구역명으로 표시됩니다.
+# 반경은 AIS 위치 흔들림과 지도 표시 오차를 감안해 실제 표식보다 조금 여유 있게 잡았습니다.
+BUOY_AREAS = [
+    {"name": "SK_B#2", "display": "SK_B#2 부이", "lat": 35.438800, "lon": 129.393400, "radius_m": 350},
+    {"name": "SK_B#3", "display": "SK_B#3 부이", "lat": 35.429500, "lon": 129.393300, "radius_m": 350},
+    {"name": "S.OIL_B#1", "display": "S.OIL_B#1 부이", "lat": 35.407100, "lon": 129.395400, "radius_m": 400},
+    {"name": "S.OIL_B#2", "display": "S.OIL_B#2 부이", "lat": 35.396700, "lon": 129.393100, "radius_m": 400},
+]
+
+
+def buoy_zone_from_lat_lon(lat: float, lon: float) -> str | None:
+    if lat == 0 or lon == 0:
+        return None
+
+    nearest = None
+    nearest_km = 999.0
+
+    for area in BUOY_AREAS:
+        distance_km = _distance_km(lat, lon, float(area["lat"]), float(area["lon"]))
+        radius_km = float(area["radius_m"]) / 1000.0
+        if distance_km <= radius_km and distance_km < nearest_km:
+            nearest = area
+            nearest_km = distance_km
+
+    if nearest is None:
+        return None
+
+    return str(nearest["display"])
+
+
+def buoy_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
+    zone = buoy_zone_from_lat_lon(lat, lon)
+    distances = []
+    for area in BUOY_AREAS:
+        distance_km = _distance_km(lat, lon, float(area["lat"]), float(area["lon"]))
+        distances.append({
+            "name": area["name"],
+            "display": area["display"],
+            "lat": area["lat"],
+            "lon": area["lon"],
+            "radiusM": area["radius_m"],
+            "distanceKm": round(distance_km, 3),
+            "inside": distance_km <= float(area["radius_m"]) / 1000.0,
+        })
+    distances.sort(key=lambda item: item["distanceKm"])
+    return {
+        "zone": zone,
+        "nearest": distances[:4],
+    }
+
+
 
 def simple_area_from_lat_lon(lat: float, lon: float) -> str:
     if lat == 0 or lon == 0:
@@ -828,7 +881,12 @@ def simple_area_from_lat_lon(lat: float, lon: float) -> str:
     if anchorage_zone:
         return anchorage_zone
 
-    # 울산항 주변의 대략적인 구역명입니다. 부두/부이 세부 판정은 다음 단계에서 확장합니다.
+    # 3.0.6: SK / S-OIL 부이는 묘박지 다음 우선순위로 세부 구역명 판정합니다.
+    buoy_zone = buoy_zone_from_lat_lon(lat, lon)
+    if buoy_zone:
+        return buoy_zone
+
+    # 울산항 주변의 대략적인 구역명입니다. 본항/온산/미포 등 세부 부두 판정은 다음 단계에서 확장합니다.
     if lat >= 35.48 and lon >= 129.42:
         return "외항/동측 해역"
     if lat >= 35.43 and lon >= 129.35:
@@ -849,8 +907,8 @@ def normalize_zone_id(value: str) -> str:
 def is_berth_area(location: str) -> bool:
     value = str(location or "").upper()
     berth_keywords = [
-        "부두", "선석", "접안", "항내/부두권", "BERTH", "DOCK", "PIER", "WHARF",
-        "SK", "S-OIL", "SOIL", "정일", "UTK", "UTT", "OTK", "본항", "염포", "온산", "용연", "용잠",
+        "부두", "선석", "접안", "항내/부두권", "부이", "BERTH", "DOCK", "PIER", "WHARF", "BUOY",
+        "SK", "S-OIL", "S.OIL", "SOIL", "정일", "UTK", "UTT", "OTK", "본항", "염포", "온산", "용연", "용잠",
     ]
     return any(keyword.upper() in value for keyword in berth_keywords)
 
@@ -1513,7 +1571,7 @@ def clear_alert_history():
 def zone_test():
     """
     서버 좌표 판정 테스트용 엔드포인트.
-    예: /zone-test?lat=35.4919&lon=129.4057
+    예: /zone-test?lat=35.4388&lon=129.3934
     """
     if not require_api_key():
         return jsonify({"ok": False, "error": "invalid api key"}), 401
@@ -1527,11 +1585,12 @@ def zone_test():
         return jsonify({
             "ok": False,
             "error": "lat and lon query parameters are required",
-            "example": "/zone-test?lat=35.4919&lon=129.4057",
+            "example": "/zone-test?lat=35.4388&lon=129.3934",
             "time": now_iso(),
         }), 400
 
     anchorage_debug = anchorage_debug_payload(lat_f, lon_f)
+    buoy_debug = buoy_debug_payload(lat_f, lon_f)
     return jsonify({
         "ok": True,
         "lat": lat_f,
@@ -1539,6 +1598,8 @@ def zone_test():
         "area": simple_area_from_lat_lon(lat_f, lon_f),
         "anchorageZone": anchorage_debug["zone"],
         "nearestAnchorages": anchorage_debug["nearest"],
+        "buoyZone": buoy_debug["zone"],
+        "nearestBuoys": buoy_debug["nearest"],
         "time": now_iso(),
     })
 
