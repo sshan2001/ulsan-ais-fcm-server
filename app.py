@@ -381,7 +381,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.0.6-zone-buoy-sk-soil",
+        "version": "3.0.7-zone-main-berths",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -871,6 +871,83 @@ def buoy_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
     }
 
 
+# 3.0.7 울산 본항 주요 부두 좌표 기반 판정
+# 2-3순위 작업 범위입니다.
+# AIS 좌표가 아래 부두 기준점 반경 안에 들어오면 "울산본항 5부두"처럼 세부 구역명으로 표시됩니다.
+# 실제 AIS 위치는 선박 중앙/안테나 위치로 잡히기 때문에 부두 표식점보다 약간 넓은 반경을 사용합니다.
+MAIN_BERTH_AREAS = [
+    {"name": "울산본항 1부두", "lat": 35.531730, "lon": 129.373200, "radius_m": 520},
+    {"name": "울산본항 2부두", "lat": 35.526781, "lon": 129.372631, "radius_m": 500},
+    {"name": "울산본항 3부두", "lat": 35.522157, "lon": 129.374700, "radius_m": 480},
+    {"name": "울산본항 4부두", "lat": 35.520900, "lon": 129.375300, "radius_m": 460},
+    {"name": "울산본항 5부두", "lat": 35.518890, "lon": 129.373743, "radius_m": 480},
+    {"name": "울산본항 6부두", "lat": 35.517085, "lon": 129.378600, "radius_m": 480},
+    {"name": "울산본항 7부두", "lat": 35.516580, "lon": 129.382712, "radius_m": 480},
+    {"name": "울산본항 8부두", "lat": 35.515100, "lon": 129.385400, "radius_m": 480},
+    {"name": "울산본항 9부두", "lat": 35.511400, "lon": 129.385700, "radius_m": 520},
+
+    {"name": "울산본항 SK1부두", "lat": 35.502700, "lon": 129.363200, "radius_m": 520},
+    {"name": "울산본항 SK2부두", "lat": 35.498600, "lon": 129.365800, "radius_m": 520},
+    {"name": "울산본항 SK3부두", "lat": 35.494600, "lon": 129.382900, "radius_m": 520},
+    {"name": "울산본항 SK4부두", "lat": 35.492700, "lon": 129.384200, "radius_m": 520},
+    {"name": "울산본항 SK5부두", "lat": 35.489200, "lon": 129.386300, "radius_m": 520},
+    {"name": "울산본항 SK6부두", "lat": 35.485500, "lon": 129.390700, "radius_m": 520},
+    {"name": "울산본항 SK7부두", "lat": 35.482400, "lon": 129.390700, "radius_m": 520},
+    {"name": "울산본항 SK8부두", "lat": 35.479100, "lon": 129.390600, "radius_m": 520},
+
+    {"name": "울산본항 UTT부두", "lat": 35.499060, "lon": 129.379200, "radius_m": 520},
+    {"name": "울산본항 가스부두", "lat": 35.485900, "lon": 129.385500, "radius_m": 520},
+    {"name": "울산본항 용잠1부두", "lat": 35.499009, "lon": 129.375800, "radius_m": 480},
+    {"name": "울산본항 용잠2부두", "lat": 35.499009, "lon": 129.375800, "radius_m": 480},
+    {"name": "울산본항 남화부두", "lat": 35.477325, "lon": 129.384306, "radius_m": 520},
+    {"name": "울산본항 석탄부두", "lat": 35.525300, "lon": 129.382060, "radius_m": 520},
+    {"name": "울산본항 양곡부두", "lat": 35.496600, "lon": 129.381000, "radius_m": 520},
+    {"name": "울산본항 염포부두", "lat": 35.516500, "lon": 129.395890, "radius_m": 620},
+    {"name": "울산본항 일반부두", "lat": 35.507930, "lon": 129.386092, "radius_m": 520},
+    {"name": "울산본항 자동차부두", "lat": 35.523100, "lon": 129.391200, "radius_m": 620},
+]
+
+
+def main_berth_zone_from_lat_lon(lat: float, lon: float) -> str | None:
+    if lat == 0 or lon == 0:
+        return None
+
+    nearest = None
+    nearest_km = 999.0
+
+    for area in MAIN_BERTH_AREAS:
+        distance_km = _distance_km(lat, lon, float(area["lat"]), float(area["lon"]))
+        radius_km = float(area["radius_m"]) / 1000.0
+        if distance_km <= radius_km and distance_km < nearest_km:
+            nearest = area
+            nearest_km = distance_km
+
+    if nearest is None:
+        return None
+
+    return str(nearest["name"])
+
+
+def main_berth_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
+    zone = main_berth_zone_from_lat_lon(lat, lon)
+    distances = []
+    for area in MAIN_BERTH_AREAS:
+        distance_km = _distance_km(lat, lon, float(area["lat"]), float(area["lon"]))
+        distances.append({
+            "name": area["name"],
+            "lat": area["lat"],
+            "lon": area["lon"],
+            "radiusM": area["radius_m"],
+            "distanceKm": round(distance_km, 3),
+            "inside": distance_km <= float(area["radius_m"]) / 1000.0,
+        })
+    distances.sort(key=lambda item: item["distanceKm"])
+    return {
+        "zone": zone,
+        "nearest": distances[:5],
+    }
+
+
 
 def simple_area_from_lat_lon(lat: float, lon: float) -> str:
     if lat == 0 or lon == 0:
@@ -886,7 +963,12 @@ def simple_area_from_lat_lon(lat: float, lon: float) -> str:
     if buoy_zone:
         return buoy_zone
 
-    # 울산항 주변의 대략적인 구역명입니다. 본항/온산/미포 등 세부 부두 판정은 다음 단계에서 확장합니다.
+    # 3.0.7: 울산 본항 주요 부두를 좌표 기반으로 세부 판정합니다.
+    main_berth_zone = main_berth_zone_from_lat_lon(lat, lon)
+    if main_berth_zone:
+        return main_berth_zone
+
+    # 울산항 주변의 대략적인 구역명입니다. 온산/미포/현대중공업 등 세부 부두 판정은 다음 단계에서 확장합니다.
     if lat >= 35.48 and lon >= 129.42:
         return "외항/동측 해역"
     if lat >= 35.43 and lon >= 129.35:
@@ -1591,6 +1673,7 @@ def zone_test():
 
     anchorage_debug = anchorage_debug_payload(lat_f, lon_f)
     buoy_debug = buoy_debug_payload(lat_f, lon_f)
+    main_berth_debug = main_berth_debug_payload(lat_f, lon_f)
     return jsonify({
         "ok": True,
         "lat": lat_f,
@@ -1600,6 +1683,8 @@ def zone_test():
         "nearestAnchorages": anchorage_debug["nearest"],
         "buoyZone": buoy_debug["zone"],
         "nearestBuoys": buoy_debug["nearest"],
+        "mainBerthZone": main_berth_debug["zone"],
+        "nearestMainBerths": main_berth_debug["nearest"],
         "time": now_iso(),
     })
 
