@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import time
 import requests
@@ -380,7 +381,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.0.4-watch-api-compat",
+        "version": "3.0.5-zone-anchor-m-e",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -595,11 +596,239 @@ def is_stopped_like(status: str, speed: float) -> bool:
     )
 
 
+# 3.0.5 M/E 묘박지 좌표 기반 판정
+# 모바일 지도에 표시한 실제 M1~M7, E1~E3 polygon 좌표를 서버에도 동일하게 넣었습니다.
+# AIS 좌표가 이 polygon 안에 들어오면 "M3 묘박지"처럼 세부 구역명으로 표시됩니다.
+ANCHORAGE_AREAS = [
+    {
+        "name": "M1",
+        "coords": [
+            (35.500222, 129.394167),
+            (35.495583, 129.394778),
+            (35.495583, 129.404611),
+            (35.498556, 129.402194),
+        ],
+    },
+    {
+        "name": "M2",
+        "coords": [
+            (35.495583, 129.394778),
+            (35.492694, 129.395139),
+            (35.491861, 129.395278),
+            (35.491861, 129.400361),
+            (35.495583, 129.399889),
+        ],
+    },
+    {
+        "name": "M3",
+        "coords": [
+            (35.491861, 129.405722),
+            (35.493167, 129.406556),
+            (35.495583, 129.404611),
+            (35.495583, 129.399889),
+            (35.491861, 129.400361),
+        ],
+    },
+    {
+        "name": "M4",
+        "coords": [
+            (35.491861, 129.395278),
+            (35.488056, 129.395917),
+            (35.488056, 129.403333),
+            (35.491861, 129.405722),
+        ],
+    },
+    {
+        "name": "M5",
+        "coords": [
+            (35.488056, 129.395917),
+            (35.484250, 129.396583),
+            (35.484250, 129.402639),
+            (35.486889, 129.402611),
+            (35.488056, 129.403333),
+        ],
+    },
+    {
+        "name": "M6",
+        "coords": [
+            (35.484250, 129.396583),
+            (35.480444, 129.397222),
+            (35.480444, 129.402639),
+            (35.484250, 129.402639),
+        ],
+    },
+    {
+        "name": "M7",
+        "coords": [
+            (35.480444, 129.397222),
+            (35.476417, 129.397917),
+            (35.476417, 129.402639),
+            (35.480444, 129.402639),
+        ],
+    },
+    {
+        "name": "E1",
+        "coords": [
+            (35.466389, 129.414278), (35.466389, 129.426306), (35.466452, 129.427450),
+            (35.466490, 129.428587), (35.466502, 129.429717), (35.466489, 129.430839),
+            (35.466451, 129.431954), (35.466388, 129.433060), (35.466302, 129.434159),
+            (35.466192, 129.435249), (35.466058, 129.436330), (35.465901, 129.437403),
+            (35.465721, 129.438467), (35.465519, 129.439522), (35.465295, 129.440567),
+            (35.465049, 129.441603), (35.464781, 129.442629), (35.464492, 129.443645),
+            (35.464183, 129.444651), (35.463853, 129.445647), (35.463503, 129.446632),
+            (35.463133, 129.447607), (35.462744, 129.448570), (35.462336, 129.449523),
+            (35.461909, 129.450464), (35.461463, 129.451394), (35.461000, 129.452312),
+            (35.460518, 129.453218), (35.460020, 129.454112), (35.459504, 129.454994),
+            (35.458971, 129.455863), (35.458422, 129.456720), (35.457857, 129.457564),
+            (35.457276, 129.458395), (35.456680, 129.459212), (35.456069, 129.460016),
+            (35.455443, 129.460807), (35.454803, 129.461583), (35.454148, 129.462346),
+            (35.453480, 129.463094), (35.452799, 129.463828), (35.452104, 129.464547),
+            (35.451397, 129.465252), (35.437111, 129.410972), (35.462056, 129.401306),
+        ],
+    },
+    {
+        "name": "E2",
+        "coords": [
+            (35.437111, 129.410972), (35.451397, 129.465252), (35.450677, 129.465941),
+            (35.449945, 129.466615), (35.449202, 129.467274), (35.448447, 129.467917),
+            (35.447681, 129.468545), (35.446905, 129.469156), (35.446118, 129.469751),
+            (35.445321, 129.470330), (35.444514, 129.470892), (35.443698, 129.471438),
+            (35.442873, 129.471966), (35.442040, 129.472477), (35.441198, 129.472971),
+            (35.440348, 129.473448), (35.439490, 129.473906), (35.438625, 129.474347),
+            (35.437753, 129.474769), (35.436875, 129.475173), (35.435990, 129.475559),
+            (35.435099, 129.475926), (35.434202, 129.476274), (35.433300, 129.476602),
+            (35.432393, 129.476912), (35.431482, 129.477202), (35.430566, 129.477472),
+            (35.429646, 129.477722), (35.428722, 129.477952), (35.427796, 129.478162),
+            (35.426866, 129.478351), (35.425934, 129.478520), (35.424999, 129.478668),
+            (35.424062, 129.478794), (35.423124, 129.478899), (35.420194, 129.417528),
+        ],
+    },
+    {
+        "name": "E3",
+        "coords": [
+            (35.420194, 129.417528), (35.423124, 129.478899), (35.422185, 129.478983),
+            (35.421244, 129.479045), (35.420303, 129.479086), (35.419362, 129.479104),
+            (35.418420, 129.479100), (35.417479, 129.479073), (35.416539, 129.479024),
+            (35.415600, 129.478952), (35.414662, 129.478857), (35.413727, 129.478738),
+            (35.412793, 129.478596), (35.411861, 129.478431), (35.410932, 129.478241),
+            (35.410007, 129.478028), (35.409085, 129.477790), (35.408166, 129.477528),
+            (35.407252, 129.477242), (35.406342, 129.476930), (35.405437, 129.476593),
+            (35.404537, 129.476232), (35.403642, 129.475845), (35.402753, 129.475432),
+            (35.401871, 129.474993), (35.400994, 129.474529), (35.400125, 129.474038),
+            (35.399262, 129.473521), (35.398408, 129.472977), (35.397560, 129.472406),
+            (35.396721, 129.471809), (35.395891, 129.471184), (35.395069, 129.470532),
+            (35.394257, 129.469853), (35.393453, 129.469145), (35.392660, 129.468410),
+            (35.391877, 129.467646), (35.391104, 129.466854), (35.390342, 129.466034),
+            (35.389592, 129.465185), (35.388852, 129.464307), (35.388125, 129.463400),
+            (35.387410, 129.462463), (35.386707, 129.461497), (35.386017, 129.460501),
+            (35.385340, 129.459475), (35.384677, 129.458420), (35.384028, 129.457333),
+            (35.403056, 129.424167),
+        ],
+    },
+]
+
+
+def point_in_polygon(lat: float, lon: float, coords: List[tuple[float, float]]) -> bool:
+    """
+    Ray-casting 방식의 polygon 내부 판정.
+    coords는 [(lat, lon), ...]이고, 계산에서는 lon을 x, lat을 y로 사용합니다.
+    """
+    if not coords:
+        return False
+
+    x = lon
+    y = lat
+    inside = False
+    j = len(coords) - 1
+
+    for i in range(len(coords)):
+        yi, xi = coords[i]
+        yj, xj = coords[j]
+        intersects = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) if (yj - yi) != 0 else 1e-12) + xi
+        )
+        if intersects:
+            inside = not inside
+        j = i
+
+    return inside
+
+
+def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """작은 거리 비교용 Haversine 거리(km)."""
+    radius_km = 6371.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius_km * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1 - a)))
+
+
+def _polygon_center(coords: List[tuple[float, float]]) -> tuple[float, float]:
+    if not coords:
+        return 0.0, 0.0
+    return sum(p[0] for p in coords) / len(coords), sum(p[1] for p in coords) / len(coords)
+
+
+def anchorage_zone_from_lat_lon(lat: float, lon: float) -> str | None:
+    if lat == 0 or lon == 0:
+        return None
+
+    # 1순위: 실제 M/E polygon 내부 판정
+    for area in ANCHORAGE_AREAS:
+        if point_in_polygon(lat, lon, area["coords"]):
+            return f'{area["name"]} 묘박지'
+
+    # 2순위: AIS 좌표 흔들림 보정. M구역은 작으므로 250m 이내만 "인근"으로 인정합니다.
+    # E구역은 면적이 넓고 서로 인접하므로 polygon 밖은 보수적으로 인근 판정을 하지 않습니다.
+    nearest_name = ""
+    nearest_km = 999.0
+    for area in ANCHORAGE_AREAS:
+        name = str(area["name"])
+        if not name.startswith("M"):
+            continue
+        center_lat, center_lon = _polygon_center(area["coords"])
+        distance = _distance_km(lat, lon, center_lat, center_lon)
+        if distance < nearest_km:
+            nearest_km = distance
+            nearest_name = name
+
+    if nearest_name and nearest_km <= 0.25:
+        return f"{nearest_name} 묘박지 인근"
+
+    return None
+
+
+def anchorage_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
+    zone = anchorage_zone_from_lat_lon(lat, lon)
+    distances = []
+    for area in ANCHORAGE_AREAS:
+        center_lat, center_lon = _polygon_center(area["coords"])
+        distances.append({
+            "name": area["name"],
+            "centerLat": round(center_lat, 6),
+            "centerLon": round(center_lon, 6),
+            "distanceKm": round(_distance_km(lat, lon, center_lat, center_lon), 3),
+            "inside": point_in_polygon(lat, lon, area["coords"]),
+        })
+    distances.sort(key=lambda item: item["distanceKm"])
+    return {
+        "zone": zone,
+        "nearest": distances[:3],
+    }
+
+
 def simple_area_from_lat_lon(lat: float, lon: float) -> str:
     if lat == 0 or lon == 0:
         return "위치 확인중"
 
-    # 울산항 주변의 대략적인 구역명입니다. 정확한 부두/묘박지 판정은 2.9.14에서 세분화합니다.
+    # 3.0.5: M1~M7 / E1~E3 묘박지는 가장 먼저 세부 구역명으로 판정합니다.
+    anchorage_zone = anchorage_zone_from_lat_lon(lat, lon)
+    if anchorage_zone:
+        return anchorage_zone
+
+    # 울산항 주변의 대략적인 구역명입니다. 부두/부이 세부 판정은 다음 단계에서 확장합니다.
     if lat >= 35.48 and lon >= 129.42:
         return "외항/동측 해역"
     if lat >= 35.43 and lon >= 129.35:
@@ -1276,6 +1505,40 @@ def clear_alert_history():
         "ok": True,
         "cleared": True,
         "message": "alert history, duplicate state, ais ship state cleared",
+        "time": now_iso(),
+    })
+
+
+@app.get("/zone-test")
+def zone_test():
+    """
+    서버 좌표 판정 테스트용 엔드포인트.
+    예: /zone-test?lat=35.4919&lon=129.4057
+    """
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    lat = request.args.get("lat", "").strip()
+    lon = request.args.get("lon", "").strip()
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "error": "lat and lon query parameters are required",
+            "example": "/zone-test?lat=35.4919&lon=129.4057",
+            "time": now_iso(),
+        }), 400
+
+    anchorage_debug = anchorage_debug_payload(lat_f, lon_f)
+    return jsonify({
+        "ok": True,
+        "lat": lat_f,
+        "lon": lon_f,
+        "area": simple_area_from_lat_lon(lat_f, lon_f),
+        "anchorageZone": anchorage_debug["zone"],
+        "nearestAnchorages": anchorage_debug["nearest"],
         "time": now_iso(),
     })
 
