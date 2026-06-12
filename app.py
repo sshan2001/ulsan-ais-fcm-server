@@ -35,7 +35,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "300"))
 
-# 3.0.3 특수 이벤트 설정
+# 3.1.0 특수 이벤트/이벤트 흐름 설정
 # 일반 이벤트는 AIS_ALERT_COOLDOWN_MINUTES(기본 30분) 쿨다운을 유지합니다.
 # 아래 특수 이벤트는 30분 쿨다운을 무시하고,
 # 선박 + 구역 + 단계 기준으로 1회씩 발송합니다.
@@ -381,7 +381,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.0.9-zone-priority-clean",
+        "version": "3.1.0-event-flow-clean",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -1173,12 +1173,118 @@ def anchorage_zone_label(location: str) -> str:
         return "묘박지"
     return value
 
+
+
+def zone_type_from_location(location: str) -> str:
+    """
+    알림 문구와 이벤트 흐름 정리에 사용할 구역 유형입니다.
+    - anchorage: M/E 묘박지
+    - berth: 부두/선석/부이
+    - route: 항로/접근/항내/외항 같은 넓은 해역
+    - unknown: 위치 확인 불가
+    """
+    value = str(location or "").strip()
+    if not value or value == "위치 확인중":
+        return "unknown"
+    if is_anchorage_area(value):
+        return "anchorage"
+    if is_berth_area(value):
+        return "berth"
+    upper = value.upper()
+    route_keywords = ["항로", "접근", "항내", "외항", "해역", "PORT", "ROUTE", "APPROACH"]
+    if any(keyword in upper for keyword in route_keywords):
+        return "route"
+    return "broad_area"
+
+
+def facility_action_words(location: str) -> Dict[str, str]:
+    """부두와 부이를 같은 berth 계열로 다루되, 사용자 알림 문구는 자연스럽게 분리합니다."""
+    value = str(location or "")
+    if "부이" in value or "BUOY" in value.upper():
+        return {
+            "approaching": "부이 계류중",
+            "completed": "부이 계류완료",
+            "approach_body": "부이 계류 중",
+            "complete_body": "부이 계류완료 상태",
+            "flow": "입항 → 부이 접근중 → 계류완료",
+        }
+    return {
+        "approaching": "부두 접안중",
+        "completed": "부두 접안완료",
+        "approach_body": "접안 중",
+        "complete_body": "접안완료 상태",
+        "flow": "입항 → 부두 접근중 → 접안완료",
+    }
+
+
+def flow_stage_from_snapshot(location: str, status: str, speed: float) -> Dict[str, str]:
+    """
+    3.1.0 이벤트 흐름 단계.
+    이 값은 푸시 data와 서버 히스토리에 같이 저장되어, 나중에 앱에서 흐름별 필터/표시를 하기 쉽게 만듭니다.
+    """
+    zone_type = zone_type_from_location(location)
+    status_text = str(status or "")
+    status_upper = status_text.upper()
+
+    stopped = is_stopped_like(status_text, speed)
+    underway = is_underway_like(status_text, speed)
+
+    if zone_type == "anchorage":
+        if speed <= 0.1:
+            return {"code": "ANCHORAGE_COMPLETED", "label": "투묘완료", "zoneType": zone_type}
+        if 0.5 <= speed <= 1.5:
+            return {"code": "ANCHORAGE_APPROACHING", "label": "묘지 접근중", "zoneType": zone_type}
+        if stopped:
+            return {"code": "ANCHORAGE_WAITING", "label": "묘박지 대기", "zoneType": zone_type}
+        return {"code": "ANCHORAGE_MOVING", "label": "묘박지 이동", "zoneType": zone_type}
+
+    if zone_type == "berth":
+        words = facility_action_words(location)
+        berth_completed_status = (
+            "MOORED" in status_upper
+            or "접안" in status_text
+            or "정박" in status_text
+            or "BERTH" in status_upper
+            or "DOCK" in status_upper
+            or "ANCHOR" in status_upper
+        )
+        if speed <= 0.1 and berth_completed_status:
+            return {"code": "BERTH_COMPLETED", "label": words["completed"], "zoneType": zone_type}
+        if 0.5 <= speed <= 1.0:
+            return {"code": "BERTH_APPROACHING", "label": words["approaching"], "zoneType": zone_type}
+        if stopped:
+            return {"code": "BERTH_NEAR_STOPPED", "label": "부두권 저속/대기", "zoneType": zone_type}
+        return {"code": "BERTH_NEAR_MOVING", "label": "부두권 이동", "zoneType": zone_type}
+
+    if zone_type == "route":
+        if underway:
+            if "외항" in location or "동측" in location:
+                return {"code": "PORT_APPROACH", "label": "입항 접근중", "zoneType": zone_type}
+            return {"code": "ROUTE_MOVING", "label": "항로 이동중", "zoneType": zone_type}
+        if stopped:
+            return {"code": "ROUTE_WAITING", "label": "항로/항내 대기", "zoneType": zone_type}
+        return {"code": "ROUTE_CHECK", "label": "항로 확인중", "zoneType": zone_type}
+
+    if underway:
+        return {"code": "MOVING", "label": "이동중", "zoneType": zone_type}
+    if stopped:
+        return {"code": "STOPPED", "label": "정지/대기", "zoneType": zone_type}
+    return {"code": "TRACKING", "label": "추적중", "zoneType": zone_type}
+
+
+def flow_summary_line(current: Dict[str, Any]) -> str:
+    stage = str(current.get("flowLabel") or "추적중")
+    location = str(current.get("location") or "위치 확인중")
+    speed = float(current.get("speed", 0.0) or 0.0)
+    return f"📍 구역: {location}\n🧭 흐름: {stage}\n⚡ 속도: {speed:.1f} kn"
+
 def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
     lat = float(info.get("lat", 0.0) or 0.0)
     lon = float(info.get("lon", 0.0) or 0.0)
     speed = float(info.get("speed", 0.0) or 0.0)
     status = str(info.get("status", "-"))
     location = str(info.get("location") or simple_area_from_lat_lon(lat, lon))
+    flow = flow_stage_from_snapshot(location, status, speed)
 
     return {
         "shipName": normalize_ship_name(ship_name),
@@ -1188,6 +1294,9 @@ def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
         "lat": lat,
         "lon": lon,
         "location": location,
+        "zoneType": flow.get("zoneType", "unknown"),
+        "flowStage": flow.get("code", "TRACKING"),
+        "flowLabel": flow.get("label", "추적중"),
         "destination": str(info.get("destination", "-")),
         "eta": str(info.get("eta", "-")),
         "seenAt": now_iso(),
@@ -1196,19 +1305,13 @@ def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
 
 def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[str, Any] | None, force: bool = False) -> List[Dict[str, str]]:
     """
-    이전 AIS 상태와 현재 AIS 상태를 비교해서 발송할 이벤트 목록을 만듭니다.
+    3.1.0 이벤트 흐름 정리.
 
-    3.0.3 핵심 변경:
-    - 일반 이벤트는 기존 30분 쿨다운 유지
-    - 특수 이벤트는 30분 쿨다운 예외
-    - 특수 이벤트는 선박 + 구역 + 단계 기준 1회만 발송
-    - 부두 접안중 / 부두 접안완료 / M/E 묘지 투묘중 / M/E 묘지 투묘완료를 분리
-
-    특수 이벤트 조건:
-    - 부두 접안중: 부두권 + 0.5~1.0kn
-    - 부두 접안완료: 부두권 + 0.1kn 이하 + 정박/MOORED/접안 계열 상태
-    - 묘지 투묘중: M/E 묘지/정박지 + 0.5~1.5kn
-    - 묘지 투묘완료: M/E 묘지/정박지 + 0.1kn 이하
+    목표:
+    - 특수 이벤트는 기존처럼 30분 쿨다운 예외, 선박+구역+단계 기준 1회 발송
+    - 같은 AIS 갱신에서 특수 이벤트/출항 이벤트가 잡히면 일반 상태변경·위치변경 알림은 생략
+    - 알림 문구를 입항→부두접근→접안완료 / 입항→묘지접근→투묘완료 / 정박→출항→항로이동 흐름으로 정리
+    - flowStage/zoneType은 current snapshot에 저장되어 이후 앱 표시 확장에 사용할 수 있게 함
     """
     events: List[Dict[str, str]] = []
     name = normalize_ship_name(ship_name)
@@ -1216,6 +1319,8 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
     current_status = str(current.get("status", "-"))
     current_speed = float(current.get("speed", 0.0) or 0.0)
     current_location = str(current.get("location", "위치 확인중"))
+    current_flow_stage = str(current.get("flowStage", "TRACKING"))
+    current_flow_label = str(current.get("flowLabel", "추적중"))
 
     has_previous = isinstance(previous, dict)
 
@@ -1223,12 +1328,13 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         events.append({
             "eventType": "ais_first_detected",
             "title": f"🚢 {name} AIS 최초 감지",
-            "body": f"{name} 선박이 울산항 AIS에서 처음 감지되었습니다. 위치: {current_location}",
+            "body": f"{name} 선박이 울산항 AIS에서 처음 감지되었습니다.\n{flow_summary_line(current)}",
         })
 
     previous_status = str(previous.get("status", "-")) if has_previous else "-"
     previous_speed = float(previous.get("speed", 0.0) or 0.0) if has_previous else 0.0
     previous_location = str(previous.get("location", "위치 확인중")) if has_previous else "위치 확인중"
+    previous_flow_stage = str(previous.get("flowStage", "")) if has_previous else ""
 
     prev_stopped = is_stopped_like(previous_status, previous_speed)
     now_stopped = is_stopped_like(current_status, current_speed)
@@ -1249,35 +1355,39 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         or "정박" in current_status
         or "BERTH" in current_status_upper
         or "DOCK" in current_status_upper
+        or "ANCHOR" in current_status_upper
     )
 
     special_event_added = False
+    departure_event_added = False
+    flow_event_added = False
 
-    # 부두 접안중: 부두/선석권에서 0.5~1.0kn 사이로 천천히 접근하는 단계.
-    # 30분 쿨다운과 무관하며, should_send_ais_alert()에서 선박+구역+단계 기준 1회만 발송됩니다.
+    # 부두/부이 접근중: 부두권 또는 부이권에서 0.5~1.0kn 저속 접근.
     if berth_area and 0.5 <= current_speed <= 1.0:
+        words = facility_action_words(berth_zone)
         events.append({
             "eventType": f"berth_approaching:{berth_zone_id}",
-            "title": f"🚢 {name} 부두 접안중",
-            "body": f"{name} 선박이 {berth_zone} 근처에서 접안 중으로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
+            "title": f"🚢 {name} {words['approaching']}",
+            "body": f"{name} 선박이 {berth_zone} 근처에서 {words['approach_body']}으로 감지되었습니다.\n{flow_summary_line(current)}\n➡️ {words['flow']}",
         })
         special_event_added = True
 
-    # 부두 접안완료: 부두/선석권 + 0.1kn 이하 + 정박/MOORED/접안 계열 상태.
+    # 부두/부이 완료: 부두권 또는 부이권 + 0.1kn 이하 + 정박/접안/MOORED 계열 상태.
     if berth_area and current_speed <= 0.1 and berth_completed_status:
+        words = facility_action_words(berth_zone)
         events.append({
             "eventType": f"berth_completed:{berth_zone_id}",
-            "title": f"⚓ {name} 부두 접안완료",
-            "body": f"{name} 선박이 {berth_zone}에서 접안완료 상태로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
+            "title": f"⚓ {name} {words['completed']}",
+            "body": f"{name} 선박이 {berth_zone}에서 {words['complete_body']}로 감지되었습니다.\n{flow_summary_line(current)}\n✅ {words['flow']}",
         })
         special_event_added = True
 
-    # 묘박지 투묘중: M/E 묘지 또는 정박지에서 0.5~1.5kn 사이로 감속/진입하는 단계.
+    # 묘박지 투묘중: M/E 묘지 또는 정박지에서 0.5~1.5kn 사이로 감속/진입.
     if anchorage_area and 0.5 <= current_speed <= 1.5:
         events.append({
             "eventType": f"anchorage_approaching:{anchorage_zone_id}",
             "title": f"⚓ {name} 묘지 투묘중",
-            "body": f"{name} 선박이 {anchorage_zone}에서 투묘 중으로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
+            "body": f"{name} 선박이 {anchorage_zone}에서 투묘 중으로 감지되었습니다.\n{flow_summary_line(current)}\n➡️ 입항 → 묘지 접근중 → 투묘완료",
         })
         special_event_added = True
 
@@ -1286,38 +1396,60 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         events.append({
             "eventType": f"anchorage_completed:{anchorage_zone_id}",
             "title": f"⚓ {name} 묘지 투묘완료",
-            "body": f"{name} 선박이 {anchorage_zone}에서 투묘완료 상태로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
+            "body": f"{name} 선박이 {anchorage_zone}에서 투묘완료 상태로 감지되었습니다.\n{flow_summary_line(current)}\n✅ 입항 → 묘지 접근중 → 투묘완료",
         })
         special_event_added = True
 
+    # 정박/접안/투묘 상태에서 항해 상태로 바뀌면 출항 흐름으로 우선 알림.
     if has_previous and prev_stopped and now_underway:
         events.append({
             "eventType": "departure_detected",
-            "title": f"🔔 {name} 출항 · 이동 시작",
-            "body": f"{name} 선박이 {previous_location}에서 이동을 시작했습니다. 현재 속도: {current_speed:.1f} kn",
+            "title": f"🔔 {name} 출항 · 항로 이동",
+            "body": f"{name} 선박이 {previous_location}에서 이동을 시작했습니다.\n📍 현재 구역: {current_location}\n🧭 흐름: 정박/접안 → 출항 → 항로 이동\n⚡ 현재 속도: {current_speed:.1f} kn",
         })
+        departure_event_added = True
 
-    # 특수 접안/투묘 이벤트가 이미 잡힌 경우에는 기존의 포괄적 anchored_or_docked 알림은 생략합니다.
-    # 이렇게 해야 '접안중 → 접안완료'처럼 세분화된 알림이 일반 정박 알림에 묻히지 않습니다.
-    if has_previous and prev_underway and now_stopped and not special_event_added:
+    # 항로/접근 해역 진입은 특수 이벤트가 아닐 때만 일반 흐름 이벤트로 기록.
+    if (
+        has_previous
+        and not special_event_added
+        and not departure_event_added
+        and current_flow_stage in ("PORT_APPROACH", "ROUTE_MOVING")
+        and previous_flow_stage != current_flow_stage
+        and current_speed >= 3.0
+    ):
+        events.append({
+            "eventType": f"flow_stage:{current_flow_stage}",
+            "title": f"🧭 {name} {current_flow_label}",
+            "body": f"{name} 선박의 운항 흐름이 {current_flow_label} 단계로 변경되었습니다.\n📍 현재 구역: {current_location}\n⚡ 속도: {current_speed:.1f} kn",
+        })
+        flow_event_added = True
+
+    major_event_added = special_event_added or departure_event_added or flow_event_added
+
+    # 특수 이벤트가 없고, 항해→정지로 바뀐 경우에만 포괄 정박/접안 감지.
+    if has_previous and prev_underway and now_stopped and not major_event_added:
         events.append({
             "eventType": "anchored_or_docked",
             "title": f"⚓ {name} 정박 · 접안 감지",
-            "body": f"{name} 선박이 정박 또는 접안 상태로 감지되었습니다. 위치: {current_location}",
+            "body": f"{name} 선박이 정박 또는 접안 상태로 감지되었습니다.\n{flow_summary_line(current)}",
         })
+        major_event_added = True
 
-    if has_previous and previous_status != current_status:
+    # 같은 갱신에서 큰 흐름 이벤트가 이미 잡혔다면 상태/위치 일반 알림은 생략합니다.
+    # 이렇게 해야 '접안완료 + 상태변경 + 위치변경'이 한꺼번에 오는 소음을 줄일 수 있습니다.
+    if has_previous and not major_event_added and previous_status != current_status:
         events.append({
             "eventType": f"status_changed:{current_status}",
             "title": f"📡 {name} AIS 상태 변화",
-            "body": f"{name} 상태가 {previous_status} → {current_status} 로 변경되었습니다.",
+            "body": f"{name} 상태가 {previous_status} → {current_status} 로 변경되었습니다.\n{flow_summary_line(current)}",
         })
 
-    if has_previous and previous_location != current_location and current_location != "위치 확인중":
+    if has_previous and not major_event_added and previous_location != current_location and current_location != "위치 확인중":
         events.append({
             "eventType": f"location_changed:{current_location}",
             "title": f"📍 {name} 위치 변화",
-            "body": f"{name} 위치가 {previous_location} → {current_location} 로 변경되었습니다.",
+            "body": f"{name} 위치가 {previous_location} → {current_location} 로 변경되었습니다.\n🧭 현재 흐름: {current_flow_label}",
         })
 
     # 너무 조용한 선박도 force 테스트에서는 감지 이벤트를 확인할 수 있게 합니다.
@@ -1325,7 +1457,7 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         events.append({
             "eventType": "ais_force_status_check",
             "title": f"🚢 {name} AIS 상태 확인",
-            "body": f"{name} 현재 상태: {current_status}, 속도: {current_speed:.1f} kn, 위치: {current_location}",
+            "body": f"{name} 현재 상태: {current_status}, 속도: {current_speed:.1f} kn, 위치: {current_location}, 흐름: {current_flow_label}",
         })
 
     return events
@@ -1436,6 +1568,9 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
                     "status": str(current_snapshot.get("status", "-")),
                     "speed": str(current_snapshot.get("speed", 0.0)),
                     "location": str(current_snapshot.get("location", "위치 확인중")),
+                    "zoneType": str(current_snapshot.get("zoneType", "unknown")),
+                    "flowStage": str(current_snapshot.get("flowStage", "TRACKING")),
+                    "flowLabel": str(current_snapshot.get("flowLabel", "추적중")),
                     "sentAt": now_iso(),
                 },
             )
