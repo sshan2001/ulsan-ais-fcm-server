@@ -381,7 +381,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "3.0.7-zone-main-berths",
+        "version": "3.0.8-zone-onsan-mipo-etc",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -949,6 +949,89 @@ def main_berth_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
 
 
 
+# 3.0.8 온산 / 신항 / 미포 / 현대 / KPX / 기타 울산항 부두 좌표 기반 판정
+# 2-4순위 작업 범위입니다.
+# 기존 모바일 지도에 들어가 있던 부두 기준점을 서버 판정에도 확장 적용합니다.
+# 본항 주요 부두는 MAIN_BERTH_AREAS에서 먼저 판정하고,
+# 아래 구역은 그 다음 우선순위로 판정합니다.
+OTHER_BERTH_AREAS = [
+    # 울산신항 / 용연 / 신항 컨테이너 권역
+    {"name": "울산신항 LS MNM 신항부두", "lat": 35.436240, "lon": 129.367230, "radius_m": 620},
+    {"name": "울산신항 UTK 신항부두", "lat": 35.431880, "lon": 129.370980, "radius_m": 620},
+    {"name": "울산신항 대한통운신항부두", "lat": 35.435820, "lon": 129.369530, "radius_m": 620},
+    {"name": "울산신항 신항컨부두", "lat": 35.455740, "lon": 129.366700, "radius_m": 620},
+    {"name": "울산신항 신항일반부두", "lat": 35.457870, "lon": 129.360860, "radius_m": 620},
+    {"name": "울산신항 작업 및 관리부두", "lat": 35.459660, "lon": 129.355010, "radius_m": 620},
+    {"name": "울산신항 용연부두", "lat": 35.460970, "lon": 129.371880, "radius_m": 620},
+    {"name": "울산신항 신항남방파제 T/S부두", "lat": 35.438750, "lon": 129.378110, "radius_m": 650},
+    {"name": "울산신항 신항북방파제 T/S부두", "lat": 35.460690, "lon": 129.384320, "radius_m": 650},
+
+    # 온산항 / OTK / S-OIL / 대한유화 / 달포 권역
+    {"name": "온산항 OTK1부두", "lat": 35.461210, "lon": 129.347350, "radius_m": 620},
+    {"name": "온산항 OTK2부두", "lat": 35.465350, "lon": 129.345710, "radius_m": 620},
+    {"name": "온산항 UTK부두", "lat": 35.469500, "lon": 129.341910, "radius_m": 650},
+    {"name": "온산항 S-Oil 1부두", "lat": 35.448310, "lon": 129.354950, "radius_m": 620},
+    {"name": "온산항 S-Oil 2부두", "lat": 35.447660, "lon": 129.358450, "radius_m": 620},
+    {"name": "온산항 S-Oil 3부두", "lat": 35.451810, "lon": 129.348880, "radius_m": 620},
+    {"name": "온산항 S-Oil 4부두", "lat": 35.445420, "lon": 129.358740, "radius_m": 620},
+    {"name": "온산항 온산1부두", "lat": 35.438510, "lon": 129.356670, "radius_m": 620},
+    {"name": "온산항 온산2부두", "lat": 35.439420, "lon": 129.359470, "radius_m": 620},
+    {"name": "온산항 온산3부두", "lat": 35.440460, "lon": 129.362470, "radius_m": 620},
+    {"name": "온산항 온산4부두", "lat": 35.441040, "lon": 129.364470, "radius_m": 620},
+    {"name": "온산항 달포부두", "lat": 35.439400, "lon": 129.354440, "radius_m": 620},
+    {"name": "온산항 대한유화부두", "lat": 35.457020, "lon": 129.347760, "radius_m": 620},
+
+    # 사용자가 요청한 추가 권역. 실제 현장 테스트 후 반경/중심점은 계속 보정할 수 있습니다.
+    {"name": "온산항 KPX부두", "lat": 35.453400, "lon": 129.350600, "radius_m": 550},
+
+    # 장생포 / 미포 / 현대 권역
+    {"name": "장생포항", "lat": 35.503600, "lon": 129.375500, "radius_m": 850},
+    {"name": "미포항 현대미포부두", "lat": 35.524500, "lon": 129.437680, "radius_m": 800},
+    {"name": "미포항 미포부두", "lat": 35.524500, "lon": 129.437680, "radius_m": 700},
+    {"name": "현대중공업 안벽", "lat": 35.529000, "lon": 129.445000, "radius_m": 1000},
+]
+
+
+def other_berth_zone_from_lat_lon(lat: float, lon: float) -> str | None:
+    if lat == 0 or lon == 0:
+        return None
+
+    nearest = None
+    nearest_km = 999.0
+
+    for area in OTHER_BERTH_AREAS:
+        distance_km = _distance_km(lat, lon, float(area["lat"]), float(area["lon"]))
+        radius_km = float(area["radius_m"]) / 1000.0
+        if distance_km <= radius_km and distance_km < nearest_km:
+            nearest = area
+            nearest_km = distance_km
+
+    if nearest is None:
+        return None
+
+    return str(nearest["name"])
+
+
+def other_berth_debug_payload(lat: float, lon: float) -> Dict[str, Any]:
+    zone = other_berth_zone_from_lat_lon(lat, lon)
+    distances = []
+    for area in OTHER_BERTH_AREAS:
+        distance_km = _distance_km(lat, lon, float(area["lat"]), float(area["lon"]))
+        distances.append({
+            "name": area["name"],
+            "lat": area["lat"],
+            "lon": area["lon"],
+            "radiusM": area["radius_m"],
+            "distanceKm": round(distance_km, 3),
+            "inside": distance_km <= float(area["radius_m"]) / 1000.0,
+        })
+    distances.sort(key=lambda item: item["distanceKm"])
+    return {
+        "zone": zone,
+        "nearest": distances[:8],
+    }
+
+
 def simple_area_from_lat_lon(lat: float, lon: float) -> str:
     if lat == 0 or lon == 0:
         return "위치 확인중"
@@ -968,7 +1051,12 @@ def simple_area_from_lat_lon(lat: float, lon: float) -> str:
     if main_berth_zone:
         return main_berth_zone
 
-    # 울산항 주변의 대략적인 구역명입니다. 온산/미포/현대중공업 등 세부 부두 판정은 다음 단계에서 확장합니다.
+    # 3.0.8: 온산/신항/미포/현대/KPX/기타 울산항 부두를 세부 판정합니다.
+    other_berth_zone = other_berth_zone_from_lat_lon(lat, lon)
+    if other_berth_zone:
+        return other_berth_zone
+
+    # 울산항 주변의 대략적인 구역명입니다. 세부 부두 기준점 밖의 선박은 기존 넓은 구역명으로 표시합니다.
     if lat >= 35.48 and lon >= 129.42:
         return "외항/동측 해역"
     if lat >= 35.43 and lon >= 129.35:
@@ -991,6 +1079,7 @@ def is_berth_area(location: str) -> bool:
     berth_keywords = [
         "부두", "선석", "접안", "항내/부두권", "부이", "BERTH", "DOCK", "PIER", "WHARF", "BUOY",
         "SK", "S-OIL", "S.OIL", "SOIL", "정일", "UTK", "UTT", "OTK", "본항", "염포", "온산", "용연", "용잠",
+        "신항", "미포", "현대", "KPX", "장생포", "대한유화", "대한통운", "달포", "LS", "MNM",
     ]
     return any(keyword.upper() in value for keyword in berth_keywords)
 
@@ -1674,6 +1763,7 @@ def zone_test():
     anchorage_debug = anchorage_debug_payload(lat_f, lon_f)
     buoy_debug = buoy_debug_payload(lat_f, lon_f)
     main_berth_debug = main_berth_debug_payload(lat_f, lon_f)
+    other_berth_debug = other_berth_debug_payload(lat_f, lon_f)
     return jsonify({
         "ok": True,
         "lat": lat_f,
@@ -1685,6 +1775,8 @@ def zone_test():
         "nearestBuoys": buoy_debug["nearest"],
         "mainBerthZone": main_berth_debug["zone"],
         "nearestMainBerths": main_berth_debug["nearest"],
+        "otherBerthZone": other_berth_debug["zone"],
+        "nearestOtherBerths": other_berth_debug["nearest"],
         "time": now_iso(),
     })
 
