@@ -34,6 +34,17 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "300"))
 
+# 3.0.2 특수 이벤트 설정
+# 일반 이벤트는 AIS_ALERT_COOLDOWN_MINUTES(기본 30분) 쿨다운을 유지합니다.
+# 아래 특수 이벤트는 30분 쿨다운을 무시하고,
+# 선박 + 구역 + 단계 기준으로 1회씩 발송합니다.
+SPECIAL_EVENT_PREFIXES = (
+    "berth_approaching",
+    "berth_completed",
+    "anchorage_approaching",
+    "anchorage_completed",
+)
+
 SERVER_API_KEY = os.environ.get("SERVER_API_KEY", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 FIREBASE_SERVICE_ACCOUNT_FILE = os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE", "").strip()
@@ -79,20 +90,47 @@ def parse_iso_time(value: str):
         return None
 
 
+def is_special_event_type(event_type: str) -> bool:
+    return any(str(event_type).startswith(prefix) for prefix in SPECIAL_EVENT_PREFIXES)
+
+
 def should_send_ais_alert(ship_name: str, event_type: str, force: bool = False) -> tuple[bool, str]:
     """
-    같은 선박의 같은 이벤트가 너무 자주 반복 발송되지 않도록 막습니다.
-    force=True이면 중복 방지를 무시하고 테스트 발송합니다.
+    일반 이벤트: 같은 선박 + 같은 이벤트는 AIS_ALERT_COOLDOWN_MINUTES 동안 차단합니다.
+    특수 이벤트: berth_approaching/completed, anchorage_approaching/completed 계열은
+    30분 쿨다운을 무시하고 정확히 같은 event_type 기준 1회만 발송합니다.
+
+    특수 이벤트의 event_type은 반드시 구역을 포함해야 합니다.
+    예: berth_approaching:ULSAN_PORT_BERTH_AREA
+        berth_completed:SK_BUOY
+        anchorage_completed:M3
     """
     if force:
         return True, "forced"
 
-    key = f"{normalize_ship_name(ship_name)}::{event_type}"
+    normalized_ship = normalize_ship_name(ship_name)
+    event_type = str(event_type).strip()
+    key = f"{normalized_ship}::{event_type}"
     state = read_json(AIS_ALERT_FILE, {})
     now = datetime.now(timezone.utc)
 
     previous_raw = state.get(key, {}).get("sentAt") if isinstance(state.get(key), dict) else None
     previous_dt = parse_iso_time(previous_raw) if previous_raw else None
+
+    # 특수 이벤트는 30분 쿨다운 대상이 아닙니다.
+    # 대신 같은 선박 + 같은 구역 + 같은 단계는 반복 발송하지 않습니다.
+    if is_special_event_type(event_type):
+        if previous_dt is not None:
+            return False, "special event already sent"
+
+        state[key] = {
+            "shipName": normalized_ship,
+            "eventType": event_type,
+            "special": True,
+            "sentAt": now.isoformat(),
+        }
+        write_json(AIS_ALERT_FILE, cleanup_alert_state(state, now))
+        return True, "ok special"
 
     if previous_dt is not None:
         diff_minutes = (now - previous_dt).total_seconds() / 60
@@ -101,21 +139,34 @@ def should_send_ais_alert(ship_name: str, event_type: str, force: bool = False) 
             return False, f"cooldown {remain}min remaining"
 
     state[key] = {
-        "shipName": normalize_ship_name(ship_name),
+        "shipName": normalized_ship,
         "eventType": event_type,
+        "special": False,
         "sentAt": now.isoformat(),
     }
 
-    # 오래된 기록 정리: 24시간 지난 중복방지 기록 삭제
-    cleaned = {}
-    for item_key, item in state.items():
-        sent_at = parse_iso_time(item.get("sentAt")) if isinstance(item, dict) else None
-        if sent_at is not None and (now - sent_at).total_seconds() <= 24 * 3600:
-            cleaned[item_key] = item
-
-    write_json(AIS_ALERT_FILE, cleaned)
+    write_json(AIS_ALERT_FILE, cleanup_alert_state(state, now))
     return True, "ok"
 
+
+def cleanup_alert_state(state: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    """
+    중복방지 기록 정리.
+    - 일반 이벤트: 24시간 보관
+    - 특수 이벤트: 48시간 보관
+      같은 부두/묘지에서 장시간 0.0kn 상태가 유지될 때 반복 알림을 막기 위함입니다.
+    """
+    cleaned = {}
+    for item_key, item in state.items():
+        if not isinstance(item, dict):
+            continue
+        sent_at = parse_iso_time(item.get("sentAt"))
+        if sent_at is None:
+            continue
+        keep_seconds = 48 * 3600 if item.get("special") else 24 * 3600
+        if (now - sent_at).total_seconds() <= keep_seconds:
+            cleaned[item_key] = item
+    return cleaned
 
 def normalize_ship_name(value: Any) -> str:
     return str(value).strip().upper()
@@ -329,7 +380,7 @@ def index():
     summary = watch_summary(watch)
     return jsonify({
         "service": "ulsan-ais-fcm-server",
-        "version": "2.9.14",
+        "version": "3.0.2-special-berth-anchorage",
         "ok": True,
         "firebaseReady": firebase_ready,
         "firebaseError": firebase_error,
@@ -558,6 +609,45 @@ def simple_area_from_lat_lon(lat: float, lon: float) -> str:
     return "울산항 인근"
 
 
+
+def normalize_zone_id(value: str) -> str:
+    zone = str(value or "").strip().upper()
+    zone = zone.replace(" ", "_").replace("/", "_").replace("-", "_")
+    zone = "".join(ch for ch in zone if ch.isalnum() or ch in "_가-힣")
+    return zone or "UNKNOWN_ZONE"
+
+
+def is_berth_area(location: str) -> bool:
+    value = str(location or "").upper()
+    berth_keywords = [
+        "부두", "선석", "접안", "항내/부두권", "BERTH", "DOCK", "PIER", "WHARF",
+        "SK", "S-OIL", "SOIL", "정일", "UTK", "UTT", "OTK", "본항", "염포", "온산", "용연", "용잠",
+    ]
+    return any(keyword.upper() in value for keyword in berth_keywords)
+
+
+def is_anchorage_area(location: str) -> bool:
+    value = str(location or "").upper().replace(" ", "")
+    if "묘지" in value or "묘박" in value or "정박지" in value or "ANCHOR" in value:
+        return True
+    # M1~M7, E1~E3 형태. 3.0.3에서 실제 좌표 기반 세부 구역 판정으로 확장 예정.
+    import re
+    return re.search(r"(^|[^A-Z0-9])(M[1-7]|E[1-3])([^A-Z0-9]|$)", value) is not None
+
+
+def berth_zone_label(location: str) -> str:
+    value = str(location or "").strip()
+    if not value or value == "위치 확인중":
+        return "부두권"
+    return value
+
+
+def anchorage_zone_label(location: str) -> str:
+    value = str(location or "").strip()
+    if not value or value == "위치 확인중":
+        return "묘박지"
+    return value
+
 def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
     lat = float(info.get("lat", 0.0) or 0.0)
     lon = float(info.get("lon", 0.0) or 0.0)
@@ -582,6 +672,11 @@ def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
 def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[str, Any] | None, force: bool = False) -> List[Dict[str, str]]:
     """
     이전 AIS 상태와 현재 AIS 상태를 비교해서 발송할 이벤트 목록을 만듭니다.
+
+    3.0.2 핵심 변경:
+    - 일반 이벤트는 기존 30분 쿨다운 유지
+    - 부두 접안중 / 부두 접안완료 / 묘박지 투묘중 / 묘박지 투묘완료는 특수 이벤트로 분리
+    - 특수 이벤트는 30분 쿨다운과 별개로 같은 선박 + 같은 구역 + 같은 단계 기준 1회씩 발송
     """
     events: List[Dict[str, str]] = []
     name = normalize_ship_name(ship_name)
@@ -607,6 +702,53 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
     prev_underway = is_underway_like(previous_status, previous_speed)
     now_underway = is_underway_like(current_status, current_speed)
 
+    berth_area = is_berth_area(current_location)
+    anchorage_area = is_anchorage_area(current_location)
+    berth_zone = berth_zone_label(current_location)
+    anchorage_zone = anchorage_zone_label(current_location)
+    berth_zone_id = normalize_zone_id(berth_zone)
+    anchorage_zone_id = normalize_zone_id(anchorage_zone)
+
+    special_event_added = False
+
+    # 부두 접안중: 부두/선석권에서 0.5~1.0kn 사이로 천천히 접근하는 단계.
+    # 이전 속도가 더 높았거나 이전 위치가 다른 경우에만 의미 있는 단계로 봅니다.
+    if berth_area and 0.5 <= current_speed <= 1.0 and (previous_speed > 1.0 or previous_location != current_location):
+        events.append({
+            "eventType": f"berth_approaching:{berth_zone_id}",
+            "title": f"🚢 {name} 접안중",
+            "body": f"{name} 선박이 {berth_zone} 근처에서 접안 중으로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
+        })
+        special_event_added = True
+
+    # 부두 접안완료: 부두/선석권에서 0.1kn 이하 또는 AIS 상태가 접안/정박 계열.
+    if berth_area and (current_speed <= 0.1 or "MOORED" in current_status.upper() or "접안" in current_status or "정박" in current_status):
+        # 이전부터 같은 부두에서 완전히 정지해 있던 경우는 should_send_ais_alert의 특수 이벤트 1회 제한이 막아줍니다.
+        events.append({
+            "eventType": f"berth_completed:{berth_zone_id}",
+            "title": f"⚓ {name} 접안완료",
+            "body": f"{name} 선박이 {berth_zone}에서 접안완료 상태로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
+        })
+        special_event_added = True
+
+    # 묘박지 투묘중: M/E 묘지 또는 정박지에서 0.5~1.5kn 사이로 감속/진입하는 단계.
+    if anchorage_area and 0.5 <= current_speed <= 1.5 and (previous_speed > 1.5 or previous_location != current_location):
+        events.append({
+            "eventType": f"anchorage_approaching:{anchorage_zone_id}",
+            "title": f"⚓ {name} 투묘중",
+            "body": f"{name} 선박이 {anchorage_zone}에서 투묘 중으로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
+        })
+        special_event_added = True
+
+    # 묘박지 투묘완료: M/E 묘지 또는 정박지에서 0.1kn 이하 또는 ANCHOR/정박 계열.
+    if anchorage_area and (current_speed <= 0.1 or "ANCHOR" in current_status.upper() or "묘박" in current_status or "투묘" in current_status or "정박" in current_status):
+        events.append({
+            "eventType": f"anchorage_completed:{anchorage_zone_id}",
+            "title": f"⚓ {name} 투묘완료",
+            "body": f"{name} 선박이 {anchorage_zone}에서 투묘완료 상태로 감지되었습니다. 현재 속도: {current_speed:.1f} kn",
+        })
+        special_event_added = True
+
     if prev_stopped and now_underway:
         events.append({
             "eventType": "departure_detected",
@@ -614,7 +756,9 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
             "body": f"{name} 선박이 {previous_location}에서 이동을 시작했습니다. 현재 속도: {current_speed:.1f} kn",
         })
 
-    if prev_underway and now_stopped:
+    # 특수 접안/투묘 이벤트가 이미 잡힌 경우에는 기존의 포괄적 anchored_or_docked 알림은 생략합니다.
+    # 이렇게 해야 '접안중 → 접안완료'처럼 세분화된 알림이 일반 정박 알림에 묻히지 않습니다.
+    if prev_underway and now_stopped and not special_event_added:
         events.append({
             "eventType": "anchored_or_docked",
             "title": f"⚓ {name} 정박 · 접안 감지",
@@ -644,7 +788,6 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         })
 
     return events
-
 
 
 def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[str, Any]:
