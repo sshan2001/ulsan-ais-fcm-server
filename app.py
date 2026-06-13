@@ -35,6 +35,18 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "300"))
 
+SERVER_VERSION = "3.1.2-server-health-watchdog"
+SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
+
+# 3.1.2 서버 상태 진단/자동감시 워치독 설정
+# Render 유료 전환 후에도 감시 루프가 실제로 계속 도는지 앱/브라우저에서 확인하기 위한 값입니다.
+# 서버 상태 API: GET /server-health?api_key=...
+SERVER_HEALTH_FILE = DATA_DIR / "server_health.json"
+WATCHDOG_STALE_SECONDS = int(os.environ.get(
+    "WATCHDOG_STALE_SECONDS",
+    str(max(180, AUTO_CHECK_INTERVAL_SECONDS * 2 + 60)),
+))
+
 # 3.1.1 항로 좌표 판정/이벤트 흐름 설정
 # 일반 이벤트는 AIS_ALERT_COOLDOWN_MINUTES(기본 30분) 쿨다운을 유지합니다.
 # 아래 특수 이벤트는 30분 쿨다운을 무시하고,
@@ -55,9 +67,23 @@ firebase_error = ""
 
 auto_checker_started = False
 auto_checker_pid = 0
+auto_checker_thread = None
 auto_checker_last_run = ""
+auto_checker_last_started = ""
+auto_checker_last_completed = ""
+auto_checker_last_success = ""
+auto_checker_last_error = ""
 auto_checker_last_result: Dict[str, Any] = {}
 auto_checker_run_count = 0
+auto_checker_consecutive_errors = 0
+last_alert_sent_at = ""
+last_ais_count = 0
+last_detected_count = 0
+last_event_count = 0
+last_sent_count = 0
+last_watched_count = 0
+last_check_duration_ms = 0
+health_lock = threading.Lock()
 
 
 def now_iso() -> str:
@@ -89,6 +115,23 @@ def parse_iso_time(value: str):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def seconds_since_iso(value: str):
+    dt = parse_iso_time(value) if value else None
+    if dt is None:
+        return None
+    try:
+        return int((datetime.now(timezone.utc) - dt).total_seconds())
+    except Exception:
+        return None
+
+
+def safe_len(value: Any) -> int:
+    try:
+        return len(value)
+    except Exception:
+        return 0
 
 
 def is_special_event_type(event_type: str) -> bool:
@@ -215,6 +258,134 @@ def watch_summary(watch: Dict[str, Any], token: str = "", ship_name: str = "") -
     }
 
 
+def update_health_from_check_result(result: Dict[str, Any], duration_ms: int = 0) -> None:
+    """자동 AIS 검사 결과를 서버 진단값으로 저장합니다."""
+    global auto_checker_last_completed, auto_checker_last_success, auto_checker_last_error
+    global auto_checker_consecutive_errors, last_ais_count, last_detected_count
+    global last_event_count, last_sent_count, last_watched_count, last_check_duration_ms
+    global last_alert_sent_at
+
+    completed_at = now_iso()
+    with health_lock:
+        auto_checker_last_completed = completed_at
+        last_check_duration_ms = int(duration_ms or 0)
+
+        if isinstance(result, dict):
+            last_watched_count = int(result.get("watchedCount") or 0)
+            last_ais_count = int(result.get("aisCount") or 0)
+            last_detected_count = int(result.get("detectedCount") or 0)
+            last_event_count = int(result.get("eventCount") or 0)
+            sent_ships = result.get("sentShips") if isinstance(result.get("sentShips"), list) else []
+            last_sent_count = len(sent_ships)
+
+            if last_sent_count > 0:
+                last_alert_sent_at = completed_at
+
+            if result.get("ok"):
+                auto_checker_last_success = completed_at
+                auto_checker_last_error = ""
+                auto_checker_consecutive_errors = 0
+            else:
+                auto_checker_last_error = str(result.get("error") or result.get("detail") or "unknown error")
+                auto_checker_consecutive_errors += 1
+        else:
+            auto_checker_last_error = "invalid check result"
+            auto_checker_consecutive_errors += 1
+
+    try:
+        write_json(SERVER_HEALTH_FILE, build_server_health_payload(include_files=False))
+    except Exception:
+        pass
+
+
+def build_server_health_payload(include_files: bool = True) -> Dict[str, Any]:
+    watch = read_json(WATCH_FILE, {}) if include_files else {}
+    tokens = read_json(TOKENS_FILE, []) if include_files else []
+    history = read_json(EVENT_FILE, []) if include_files else []
+    state = read_json(AIS_SHIP_STATE_FILE, {}) if include_files else {}
+
+    current_pid = os.getpid()
+    thread_alive = bool(
+        auto_checker_thread is not None
+        and getattr(auto_checker_thread, "is_alive", lambda: False)()
+        and auto_checker_pid == current_pid
+    )
+    last_completed_age = seconds_since_iso(auto_checker_last_completed or auto_checker_last_run)
+    last_success_age = seconds_since_iso(auto_checker_last_success)
+    last_alert_age = seconds_since_iso(last_alert_sent_at)
+
+    has_run = bool(auto_checker_last_completed or auto_checker_last_run)
+    stale = bool(
+        AUTO_CHECK_ENABLED
+        and has_run
+        and last_completed_age is not None
+        and last_completed_age > WATCHDOG_STALE_SECONDS
+    )
+
+    if not AUTO_CHECK_ENABLED:
+        status = "disabled"
+        status_label = "자동감시 꺼짐"
+    elif not thread_alive:
+        status = "warning"
+        status_label = "자동감시 스레드 확인 필요"
+    elif not has_run:
+        status = "starting"
+        status_label = "서버 시작됨 · 첫 AIS 검사 대기 중"
+    elif stale:
+        status = "stale"
+        status_label = "서버 감시 지연"
+    elif auto_checker_consecutive_errors > 0:
+        status = "warning"
+        status_label = "최근 AIS 검사 오류"
+    else:
+        status = "ok"
+        status_label = "서버 정상 감시 중"
+
+    summary = watch_summary(watch) if isinstance(watch, dict) else {}
+
+    return {
+        "ok": status in ("ok", "starting", "disabled"),
+        "service": "ulsan-ais-fcm-server",
+        "version": SERVER_VERSION,
+        "status": status,
+        "statusLabel": status_label,
+        "time": now_iso(),
+        "serverStartedAt": SERVER_STARTED_AT,
+        "serverUptimeSeconds": seconds_since_iso(SERVER_STARTED_AT),
+        "firebaseReady": firebase_ready,
+        "firebaseError": firebase_error,
+        "autoCheckEnabled": AUTO_CHECK_ENABLED,
+        "autoCheckIntervalSeconds": AUTO_CHECK_INTERVAL_SECONDS,
+        "watchdogStaleSeconds": WATCHDOG_STALE_SECONDS,
+        "autoCheckStarted": auto_checker_started,
+        "autoCheckThreadAlive": thread_alive,
+        "autoCheckPid": auto_checker_pid,
+        "currentPid": current_pid,
+        "autoCheckRunCount": auto_checker_run_count,
+        "autoCheckLastRun": auto_checker_last_run,
+        "autoCheckLastStarted": auto_checker_last_started,
+        "autoCheckLastCompleted": auto_checker_last_completed,
+        "autoCheckLastCompletedAgeSeconds": last_completed_age,
+        "autoCheckLastSuccess": auto_checker_last_success,
+        "autoCheckLastSuccessAgeSeconds": last_success_age,
+        "autoCheckLastError": auto_checker_last_error,
+        "autoCheckConsecutiveErrors": auto_checker_consecutive_errors,
+        "lastAlertSentAt": last_alert_sent_at,
+        "lastAlertSentAgeSeconds": last_alert_age,
+        "lastCheckDurationMs": last_check_duration_ms,
+        "lastWatchedCount": last_watched_count,
+        "lastAisCount": last_ais_count,
+        "lastDetectedCount": last_detected_count,
+        "lastEventCount": last_event_count,
+        "lastSentCount": last_sent_count,
+        "autoCheckLastResult": auto_checker_last_result,
+        "tokenCount": safe_len(tokens),
+        "historyCount": safe_len(history),
+        "shipStateCount": safe_len(state) if isinstance(state, dict) else 0,
+        **summary,
+    }
+
+
 def init_firebase() -> None:
     global firebase_ready, firebase_error
     if firebase_ready:
@@ -247,6 +418,7 @@ def init_firebase() -> None:
 
 
 def send_fcm_to_tokens(target_tokens: List[str], title: str, body: str, data: Dict[str, str] | None = None) -> Dict[str, Any]:
+    global last_alert_sent_at
     if not firebase_ready:
         return {
             "ok": False,
@@ -272,6 +444,7 @@ def send_fcm_to_tokens(target_tokens: List[str], title: str, body: str, data: Di
             message_id = messaging.send(msg)
             print(f"FCM SUCCESS: {message_id}")
             success += 1
+            last_alert_sent_at = now_iso()
         except Exception as exc:
             print(f"FCM ERROR: {exc}")
             errors.append(str(exc))
@@ -376,35 +549,54 @@ def before_request() -> None:
 
 @app.get("/")
 def index():
-    tokens = read_json(TOKENS_FILE, [])
-    watch = read_json(WATCH_FILE, {})
-    summary = watch_summary(watch)
-    return jsonify({
-        "service": "ulsan-ais-fcm-server",
-        "version": "3.1.1-fairway-routes",
-        "ok": True,
-        "firebaseReady": firebase_ready,
-        "firebaseError": firebase_error,
-        "tokenCount": len(tokens),
-        "autoCheckEnabled": AUTO_CHECK_ENABLED,
-        "autoCheckIntervalSeconds": AUTO_CHECK_INTERVAL_SECONDS,
-        "autoCheckStarted": auto_checker_started,
-        "autoCheckPid": auto_checker_pid,
-        "currentPid": os.getpid(),
-        "autoCheckLastRun": auto_checker_last_run,
-        **summary,
-        "time": now_iso(),
-    })
+    return jsonify(build_server_health_payload())
 
 
 @app.get("/health")
 def health():
+    # 외부 모니터링/Render 헬스체크용. API 키 없이도 최소 상태를 확인할 수 있게 둡니다.
+    payload = build_server_health_payload()
     return jsonify({
-        "ok": True,
-        "firebaseReady": firebase_ready,
-        "firebaseError": firebase_error,
-        "time": now_iso(),
+        "ok": payload.get("ok", True),
+        "service": payload.get("service"),
+        "version": payload.get("version"),
+        "status": payload.get("status"),
+        "statusLabel": payload.get("statusLabel"),
+        "firebaseReady": payload.get("firebaseReady"),
+        "autoCheckThreadAlive": payload.get("autoCheckThreadAlive"),
+        "autoCheckLastCompleted": payload.get("autoCheckLastCompleted"),
+        "autoCheckLastCompletedAgeSeconds": payload.get("autoCheckLastCompletedAgeSeconds"),
+        "autoCheckRunCount": payload.get("autoCheckRunCount"),
+        "time": payload.get("time"),
     })
+
+
+@app.get("/server-health")
+def server_health():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    ensure_auto_checker_running()
+    return jsonify(build_server_health_payload())
+
+
+@app.post("/watchdog-check")
+def watchdog_check():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    ensure_auto_checker_running()
+    payload = request.get_json(silent=True) or {}
+    force = bool(payload.get("force", False))
+    started = time.time()
+    result = perform_ais_check_once(force=force, source="watchdog")
+    update_health_from_check_result(result, int((time.time() - started) * 1000))
+    return jsonify({
+        "ok": bool(result.get("ok")),
+        "result": result,
+        "health": build_server_health_payload(),
+        "time": now_iso(),
+    }), 200 if result.get("ok") else 500
 
 
 @app.post("/register-token")
@@ -1719,7 +1911,9 @@ def check_ais_once():
     payload = request.get_json(silent=True) or {}
     force = bool(payload.get("force", False))
 
+    started = time.time()
     result = perform_ais_check_once(force=force, source="manual")
+    update_health_from_check_result(result, int((time.time() - started) * 1000))
     status = 200 if result.get("ok") else 500
     if result.get("error") == "no watched ships":
         status = 404
@@ -1731,23 +1925,15 @@ def auto_check_status():
     if not require_api_key():
         return jsonify({"ok": False, "error": "invalid api key"}), 401
 
-    return jsonify({
-        "ok": True,
-        "autoCheckEnabled": AUTO_CHECK_ENABLED,
-        "autoCheckStarted": auto_checker_started,
-        "autoCheckPid": auto_checker_pid,
-        "currentPid": os.getpid(),
-        "autoCheckIntervalSeconds": AUTO_CHECK_INTERVAL_SECONDS,
-        "autoCheckLastRun": auto_checker_last_run,
-        "autoCheckRunCount": auto_checker_run_count,
-        "autoCheckLastResult": auto_checker_last_result,
-        "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
-        "time": now_iso(),
-    })
+    payload = build_server_health_payload()
+    payload["cooldownMinutes"] = AIS_ALERT_COOLDOWN_MINUTES
+    return jsonify(payload)
 
 
 def auto_checker_loop() -> None:
     global auto_checker_last_run, auto_checker_last_result, auto_checker_run_count
+    global auto_checker_last_started, auto_checker_last_completed, auto_checker_last_error
+    global auto_checker_consecutive_errors
 
     print(f"AUTO CHECKER LOOP START enabled={AUTO_CHECK_ENABLED} interval={AUTO_CHECK_INTERVAL_SECONDS}s")
 
@@ -1755,48 +1941,64 @@ def auto_checker_loop() -> None:
     time.sleep(20)
 
     while True:
+        started_ts = now_iso()
+        started_mono = time.time()
         try:
             init_firebase()
-            auto_checker_last_run = now_iso()
-            auto_checker_run_count += 1
+            with health_lock:
+                auto_checker_last_started = started_ts
+                auto_checker_last_run = started_ts
+                auto_checker_run_count += 1
+
             result = perform_ais_check_once(force=False, source="auto")
             auto_checker_last_result = result
+            update_health_from_check_result(result, int((time.time() - started_mono) * 1000))
             print(f"AUTO CHECK RESULT: {result}")
         except Exception as exc:
-            auto_checker_last_run = now_iso()
-            auto_checker_last_result = {
+            error_payload = {
                 "ok": False,
                 "error": str(exc),
                 "source": "auto",
                 "time": now_iso(),
             }
+            with health_lock:
+                auto_checker_last_run = started_ts
+                auto_checker_last_completed = now_iso()
+                auto_checker_last_error = str(exc)
+                auto_checker_consecutive_errors += 1
+                auto_checker_last_result = error_payload
             print(f"AUTO CHECK ERROR: {exc}")
 
         time.sleep(max(60, AUTO_CHECK_INTERVAL_SECONDS))
-
 
 def ensure_auto_checker_running() -> None:
     """
     Gunicorn/Render 환경에서는 앱 import 시점과 실제 worker 실행 시점이 달라질 수 있습니다.
     그래서 요청이 들어올 때마다 현재 프로세스(pid) 안에서 자동감시 스레드가 살아있도록 보장합니다.
+    3.1.2부터는 thread.is_alive()까지 확인해서 스레드가 죽었으면 다시 시작합니다.
     """
-    global auto_checker_started, auto_checker_pid
+    global auto_checker_started, auto_checker_pid, auto_checker_thread
 
     if not AUTO_CHECK_ENABLED:
         return
 
     current_pid = os.getpid()
 
-    if auto_checker_started and auto_checker_pid == current_pid:
+    if (
+        auto_checker_started
+        and auto_checker_pid == current_pid
+        and auto_checker_thread is not None
+        and getattr(auto_checker_thread, "is_alive", lambda: False)()
+    ):
         return
 
     auto_checker_started = True
     auto_checker_pid = current_pid
 
     thread = threading.Thread(target=auto_checker_loop, daemon=True)
+    auto_checker_thread = thread
     thread.start()
     print(f"AUTO CHECKER THREAD STARTED pid={current_pid}")
-
 
 def start_auto_checker() -> None:
     ensure_auto_checker_running()
