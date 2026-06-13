@@ -35,7 +35,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "300"))
 
-SERVER_VERSION = "3.1.2-server-health-watchdog"
+SERVER_VERSION = "3.1.3-watch-sync-idle-fix"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
@@ -126,6 +126,12 @@ def seconds_since_iso(value: str):
     except Exception:
         return None
 
+
+
+
+def is_no_watched_result(result: Any) -> bool:
+    """감시 선박이 없는 상태는 서버 오류가 아니라 대기/정상 상태로 처리합니다."""
+    return isinstance(result, dict) and str(result.get("error") or "").strip() == "no watched ships"
 
 def safe_len(value: Any) -> int:
     try:
@@ -281,9 +287,11 @@ def update_health_from_check_result(result: Dict[str, Any], duration_ms: int = 0
             if last_sent_count > 0:
                 last_alert_sent_at = completed_at
 
-            if result.get("ok"):
+            if result.get("ok") or is_no_watched_result(result):
+                # no watched ships는 감시 목록이 비어 있다는 뜻입니다.
+                # 서버/AIS 오류가 아니므로 오류 카운트로 누적하지 않습니다.
                 auto_checker_last_success = completed_at
-                auto_checker_last_error = ""
+                auto_checker_last_error = "" if result.get("ok") else "no watched ships"
                 auto_checker_consecutive_errors = 0
             else:
                 auto_checker_last_error = str(result.get("error") or result.get("detail") or "unknown error")
@@ -322,29 +330,35 @@ def build_server_health_payload(include_files: bool = True) -> Dict[str, Any]:
         and last_completed_age > WATCHDOG_STALE_SECONDS
     )
 
+    summary = watch_summary(watch) if isinstance(watch, dict) else {}
+    total_watch_ships = int(summary.get("totalWatchShips") or 0)
+    no_watched_idle = total_watch_ships <= 0 or is_no_watched_result(auto_checker_last_result)
+
     if not AUTO_CHECK_ENABLED:
         status = "disabled"
         status_label = "자동감시 꺼짐"
     elif not thread_alive:
         status = "warning"
         status_label = "자동감시 스레드 확인 필요"
+    elif total_watch_ships <= 0:
+        status = "idle"
+        status_label = "감시 선박 없음 · 앱 재동기화 필요"
     elif not has_run:
         status = "starting"
         status_label = "서버 시작됨 · 첫 AIS 검사 대기 중"
     elif stale:
         status = "stale"
         status_label = "서버 감시 지연"
-    elif auto_checker_consecutive_errors > 0:
+    elif auto_checker_consecutive_errors > 0 and not no_watched_idle:
         status = "warning"
         status_label = "최근 AIS 검사 오류"
     else:
         status = "ok"
         status_label = "서버 정상 감시 중"
 
-    summary = watch_summary(watch) if isinstance(watch, dict) else {}
 
     return {
-        "ok": status in ("ok", "starting", "disabled"),
+        "ok": status in ("ok", "starting", "disabled", "idle"),
         "service": "ulsan-ais-fcm-server",
         "version": SERVER_VERSION,
         "status": status,
@@ -1760,21 +1774,17 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
         watched_ships.update(ships)
 
     if not watched_ships:
-        result_payload = {
-            "ok": False,
+        # 감시 선박이 없는 것은 오류가 아니라 "대기 상태"입니다.
+        # 이전 버전은 이 상태를 오류/점검기록으로 누적해서 앱 알림탭을 헷갈리게 만들었습니다.
+        return {
+            "ok": True,
+            "idle": True,
             "error": "no watched ships",
+            "message": "감시 선박이 없습니다. 앱에서 추적 선박을 서버와 다시 동기화해야 합니다.",
             "watchedCount": 0,
             "source": source,
             "time": now_iso(),
         }
-        # 앱/서버 연동 문제를 알림탭에서 바로 확인할 수 있도록 기록합니다.
-        history = read_json(EVENT_FILE, [])
-        history.insert(0, {
-            "type": "check_ais_no_watched_ships",
-            **result_payload,
-        })
-        write_json(EVENT_FILE, history[:200])
-        return result_payload
 
     try:
         ais_list = fetch_upa_ais_list()
@@ -1914,9 +1924,7 @@ def check_ais_once():
     started = time.time()
     result = perform_ais_check_once(force=force, source="manual")
     update_health_from_check_result(result, int((time.time() - started) * 1000))
-    status = 200 if result.get("ok") else 500
-    if result.get("error") == "no watched ships":
-        status = 404
+    status = 200 if result.get("ok") or is_no_watched_result(result) else 500
     return jsonify(result), status
 
 
