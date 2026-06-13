@@ -30,12 +30,13 @@ WATCH_FILE = DATA_DIR / "watchlist.json"
 EVENT_FILE = DATA_DIR / "event_history.json"
 AIS_ALERT_FILE = DATA_DIR / "ais_alert_state.json"
 AIS_SHIP_STATE_FILE = DATA_DIR / "ais_ship_state.json"
+AIS_BASELINE_FILE = DATA_DIR / "ais_baseline_pending.json"
 
 AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "30"))
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
-AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "300"))
+AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "60"))
 
-SERVER_VERSION = "3.1.3-watch-sync-idle-fix"
+SERVER_VERSION = "3.1.4-baseline-60s-check"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
@@ -138,6 +139,63 @@ def safe_len(value: Any) -> int:
         return len(value)
     except Exception:
         return 0
+
+
+def mark_baseline_pending_for_missing_state(ships: List[str], source: str = "register-watch", token: str = "") -> List[str]:
+    """
+    앱이 추적 선박을 새로 등록/재동기화한 직후에는
+    이미 접안/투묘 중인 선박의 현재 상태를 먼저 기준값으로 저장합니다.
+
+    목적:
+    - Render 재시작/재배포 후 앱이 감시목록을 다시 올렸을 때
+      AIS 최초감지 + 접안완료 + 투묘완료 알림이 한꺼번에 쏟아지는 현상 방지
+    - 서버에 이전 선박 상태가 없는 선박만 1회 baseline 대상으로 표시
+    """
+    normalized = unique_ship_list(ships)
+    if not normalized:
+        return []
+
+    state = read_json(AIS_SHIP_STATE_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+
+    pending = read_json(AIS_BASELINE_FILE, {})
+    if not isinstance(pending, dict):
+        pending = {}
+
+    added: List[str] = []
+    ts = now_iso()
+    token_hint = str(token or "")[:12]
+
+    for ship in normalized:
+        name = normalize_ship_name(ship)
+        if not name:
+            continue
+        if isinstance(state.get(name), dict):
+            continue
+        if name not in pending:
+            pending[name] = {
+                "shipName": name,
+                "createdAt": ts,
+                "source": source,
+                "tokenHint": token_hint,
+                "reason": "initial baseline pending",
+            }
+            added.append(name)
+
+    if added:
+        write_json(AIS_BASELINE_FILE, pending)
+
+    return added
+
+
+def prune_baseline_pending_to_watched(watched_ships: set[str]) -> None:
+    pending = read_json(AIS_BASELINE_FILE, {})
+    if not isinstance(pending, dict) or not pending:
+        return
+    keep = {k: v for k, v in pending.items() if normalize_ship_name(k) in watched_ships}
+    if len(keep) != len(pending):
+        write_json(AIS_BASELINE_FILE, keep)
 
 
 def is_special_event_type(event_type: str) -> bool:
@@ -311,6 +369,7 @@ def build_server_health_payload(include_files: bool = True) -> Dict[str, Any]:
     tokens = read_json(TOKENS_FILE, []) if include_files else []
     history = read_json(EVENT_FILE, []) if include_files else []
     state = read_json(AIS_SHIP_STATE_FILE, {}) if include_files else {}
+    baseline = read_json(AIS_BASELINE_FILE, {}) if include_files else {}
 
     current_pid = os.getpid()
     thread_alive = bool(
@@ -396,6 +455,7 @@ def build_server_health_payload(include_files: bool = True) -> Dict[str, Any]:
         "tokenCount": safe_len(tokens),
         "historyCount": safe_len(history),
         "shipStateCount": safe_len(state) if isinstance(state, dict) else 0,
+        "baselinePendingCount": safe_len(baseline) if isinstance(baseline, dict) else 0,
         **summary,
     }
 
@@ -1786,6 +1846,8 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
             "time": now_iso(),
         }
 
+    prune_baseline_pending_to_watched(watched_ships)
+
     try:
         ais_list = fetch_upa_ais_list()
     except Exception as exc:
@@ -1822,6 +1884,11 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
     skipped = []
     errors = []
     event_results = []
+    baseline_skipped = []
+    baseline_pending = read_json(AIS_BASELINE_FILE, {})
+    if not isinstance(baseline_pending, dict):
+        baseline_pending = {}
+    baseline_pending_changed = False
 
     for ship_name, info in detected_ships.items():
         target_tokens = tokens_for_ship(ship_name)
@@ -1833,7 +1900,28 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
         if not isinstance(previous_snapshot, dict):
             previous_snapshot = None
 
-        ship_events = detect_ship_events(ship_name, current_snapshot, previous_snapshot, force=force)
+        baseline_key = normalize_ship_name(ship_name)
+        baseline_mode = (
+            not force
+            and previous_snapshot is None
+            and baseline_key in baseline_pending
+        )
+
+        if baseline_mode:
+            # 첫 동기화 직후에는 현재 상태를 기준값으로 저장만 하고 알림은 보내지 않습니다.
+            # 다음 AIS 검사부터 실제 변화가 있을 때만 알림을 보냅니다.
+            ship_events = []
+            baseline_skipped.append({
+                "shipName": ship_name,
+                "reason": "initial baseline saved without push",
+                "location": str(current_snapshot.get("location", "위치 확인중")),
+                "flowStage": str(current_snapshot.get("flowStage", "TRACKING")),
+                "flowLabel": str(current_snapshot.get("flowLabel", "추적중")),
+            })
+            baseline_pending.pop(baseline_key, None)
+            baseline_pending_changed = True
+        else:
+            ship_events = detect_ship_events(ship_name, current_snapshot, previous_snapshot, force=force)
 
         for event in ship_events:
             event_type = event["eventType"]
@@ -1886,6 +1974,8 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
             cleaned_state[ship_name] = snapshot
 
     write_json(AIS_SHIP_STATE_FILE, cleaned_state)
+    if baseline_pending_changed:
+        write_json(AIS_BASELINE_FILE, baseline_pending)
 
     result_payload = {
         "ok": True,
@@ -1898,6 +1988,9 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
         "events": event_results,
         "sentShips": sent,
         "skippedShips": skipped,
+        "baselineSkippedShips": baseline_skipped,
+        "baselineSkippedCount": len(baseline_skipped),
+        "baselinePendingCount": safe_len(baseline_pending) if isinstance(baseline_pending, dict) else 0,
         "force": force,
         "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
         "errors": errors[:5],
@@ -2034,16 +2127,27 @@ def register_watch():
     }
     write_json(WATCH_FILE, watch)
 
+    baseline_pending_added = mark_baseline_pending_for_missing_state(
+        normalized_ships,
+        source="register-watch",
+        token=token,
+    )
+
     ship_name = normalized_ships[-1] if normalized_ships else ""
     summary = watch_summary(watch, token=token, ship_name=ship_name)
 
-    print(f"REGISTER WATCH token={token[:12]}... ships={normalized_ships} summary={summary}")
+    print(
+        f"REGISTER WATCH token={token[:12]}... ships={normalized_ships} "
+        f"baselinePending={baseline_pending_added} summary={summary}"
+    )
 
     return jsonify({
         "ok": True,
         "registered": True,
         "registeredShips": len(normalized_ships),
         "ships": normalized_ships,
+        "baselinePendingAdded": baseline_pending_added,
+        "baselinePendingAddedCount": len(baseline_pending_added),
         **summary,
         "time": now_iso(),
     })
@@ -2151,6 +2255,8 @@ def my_watch():
     incoming_ships = extract_ship_list_from_payload(payload)
     synced = False
 
+    baseline_pending_added: List[str] = []
+
     # Render 재배포 후 /tmp 데이터가 비어도 앱이 로컬 SharedPreferences의 선박목록을 보내주면 즉시 복구합니다.
     if token and incoming_ships:
         watch[token] = {
@@ -2159,6 +2265,11 @@ def my_watch():
             "source": "my-watch-sync",
         }
         write_json(WATCH_FILE, watch)
+        baseline_pending_added = mark_baseline_pending_for_missing_state(
+            incoming_ships,
+            source="my-watch-sync",
+            token=token,
+        )
         synced = True
 
     my_ships = []
@@ -2169,7 +2280,8 @@ def my_watch():
 
     print(
         f"MY WATCH token={token[:12]}... incoming={incoming_ships} "
-        f"synced={synced} myShips={my_ships} summary={summary}"
+        f"synced={synced} baselinePending={baseline_pending_added} "
+        f"myShips={my_ships} summary={summary}"
     )
 
     return jsonify({
@@ -2178,6 +2290,8 @@ def my_watch():
         "registered": synced,
         "ships": my_ships,
         "registeredShips": len(my_ships),
+        "baselinePendingAdded": baseline_pending_added,
+        "baselinePendingAddedCount": len(baseline_pending_added),
         **summary,
         "time": now_iso(),
     })
@@ -2224,11 +2338,12 @@ def clear_alert_history():
     write_json(EVENT_FILE, [])
     write_json(AIS_ALERT_FILE, {})
     write_json(AIS_SHIP_STATE_FILE, {})
+    write_json(AIS_BASELINE_FILE, {})
 
     return jsonify({
         "ok": True,
         "cleared": True,
-        "message": "alert history, duplicate state, ais ship state cleared",
+        "message": "alert history, duplicate state, ais ship state, baseline pending cleared",
         "time": now_iso(),
     })
 
