@@ -36,7 +36,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "60"))
 
-SERVER_VERSION = "3.1.4-baseline-60s-check"
+SERVER_VERSION = "3.1.5-per-ship-notification-toggle"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
@@ -294,31 +294,80 @@ def unique_ship_list(values: Any) -> List[str]:
     return result
 
 
+def unique_token_list(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def notification_off_ship_list_from_payload(payload: Dict[str, Any]) -> List[str]:
+    """
+    앱 버전에 따라 선박별 알림 OFF 목록 키 이름이 달라질 수 있어 여러 이름을 허용합니다.
+    알림 OFF는 추적은 유지하되, 해당 휴대폰 토큰으로 FCM 푸시만 보내지 않기 위한 설정입니다.
+    """
+    for key in (
+        "notificationOffShips",
+        "mutedShips",
+        "alertOffShips",
+        "notificationMutedShips",
+        "shipNotificationOff",
+    ):
+        values = payload.get(key)
+        if isinstance(values, list):
+            return unique_ship_list(values)
+
+    settings = payload.get("notificationSettings")
+    if isinstance(settings, dict):
+        off = []
+        for ship_name, enabled in settings.items():
+            if enabled is False:
+                off.append(ship_name)
+        return unique_ship_list(off)
+
+    return []
+
+
 def watch_summary(watch: Dict[str, Any], token: str = "", ship_name: str = "") -> Dict[str, Any]:
     total_watch_devices = len(watch)
     total_watch_links = 0
     total_watch_ships_set = set()
     my_watch_count = 0
+    my_notification_off_count = 0
     ship_watch_device_count = 0
+    ship_notification_enabled_device_count = 0
     normalized_ship = normalize_ship_name(ship_name)
 
     for device_token, item in watch.items():
         ships = unique_ship_list(item.get("ships", [])) if isinstance(item, dict) else []
+        notification_off_ships = unique_ship_list(item.get("notificationOffShips", [])) if isinstance(item, dict) else []
         total_watch_links += len(ships)
         total_watch_ships_set.update(ships)
 
         if token and device_token == token:
             my_watch_count = len(ships)
+            my_notification_off_count = len(notification_off_ships)
 
         if normalized_ship and normalized_ship in ships:
             ship_watch_device_count += 1
+            if normalized_ship not in notification_off_ships:
+                ship_notification_enabled_device_count += 1
 
     return {
         "watchDeviceCount": total_watch_devices,
         "totalWatchShips": len(total_watch_ships_set),
         "totalWatchLinks": total_watch_links,
         "myWatchCount": my_watch_count,
+        "myNotificationOffCount": my_notification_off_count,
         "shipWatchDeviceCount": ship_watch_device_count,
+        "shipNotificationEnabledDeviceCount": ship_notification_enabled_device_count,
     }
 
 
@@ -538,7 +587,22 @@ def tokens_for_ship(ship_name: str) -> List[str]:
 
     for token, item in watch.items():
         ships = unique_ship_list(item.get("ships", [])) if isinstance(item, dict) else []
-        if normalized in ships:
+        notification_off_ships = unique_ship_list(item.get("notificationOffShips", [])) if isinstance(item, dict) else []
+        if normalized in ships and normalized not in notification_off_ships:
+            result.append(token)
+
+    return result
+
+
+def notification_disabled_tokens_for_ship(ship_name: str) -> List[str]:
+    normalized = normalize_ship_name(ship_name)
+    watch = read_json(WATCH_FILE, {})
+    result = []
+
+    for token, item in watch.items():
+        ships = unique_ship_list(item.get("ships", [])) if isinstance(item, dict) else []
+        notification_off_ships = unique_ship_list(item.get("notificationOffShips", [])) if isinstance(item, dict) else []
+        if normalized in ships and normalized in notification_off_ships:
             result.append(token)
 
     return result
@@ -1892,6 +1956,18 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
 
     for ship_name, info in detected_ships.items():
         target_tokens = tokens_for_ship(ship_name)
+        disabled_tokens = notification_disabled_tokens_for_ship(ship_name)
+        if not target_tokens and disabled_tokens:
+            skipped.append({
+                "shipName": ship_name,
+                "eventType": "notification_off",
+                "reason": "all watchers muted this ship",
+                "mutedDeviceCount": len(disabled_tokens),
+            })
+            # 알림 OFF 선박도 현재 상태 기준값은 저장해야 다음에 알림을 다시 켰을 때 폭주하지 않습니다.
+            current_snapshot = build_ship_snapshot(ship_name, info)
+            new_state[ship_name] = current_snapshot
+            continue
         if not target_tokens:
             continue
 
@@ -2113,6 +2189,7 @@ def register_watch():
     payload = request.get_json(silent=True) or {}
     token = str(payload.get("token", "")).strip()
     ships = payload.get("ships", [])
+    notification_off_ships = notification_off_ship_list_from_payload(payload)
 
     if not token:
         return jsonify({"ok": False, "error": "token is required"}), 400
@@ -2120,9 +2197,11 @@ def register_watch():
         return jsonify({"ok": False, "error": "ships must be a list"}), 400
 
     normalized_ships = unique_ship_list(ships)
+    notification_off_ships = [name for name in notification_off_ships if name in normalized_ships]
     watch = read_json(WATCH_FILE, {})
     watch[token] = {
         "ships": normalized_ships,
+        "notificationOffShips": notification_off_ships,
         "updatedAt": now_iso(),
     }
     write_json(WATCH_FILE, watch)
@@ -2146,8 +2225,62 @@ def register_watch():
         "registered": True,
         "registeredShips": len(normalized_ships),
         "ships": normalized_ships,
+        "notificationOffShips": notification_off_ships,
+        "notificationOffCount": len(notification_off_ships),
         "baselinePendingAdded": baseline_pending_added,
         "baselinePendingAddedCount": len(baseline_pending_added),
+        **summary,
+        "time": now_iso(),
+    })
+
+
+@app.post("/set-ship-notification")
+def set_ship_notification():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    token = str(payload.get("token", "")).strip()
+    ship_name = normalize_ship_name(payload.get("shipName", ""))
+    enabled = payload.get("enabled", True)
+    enabled_bool = bool(enabled)
+
+    if not token:
+        return jsonify({"ok": False, "error": "token is required"}), 400
+    if not ship_name:
+        return jsonify({"ok": False, "error": "shipName is required"}), 400
+
+    watch = read_json(WATCH_FILE, {})
+    item = watch.get(token) if isinstance(watch, dict) else None
+    if not isinstance(item, dict):
+        item = {"ships": [], "updatedAt": now_iso()}
+
+    ships = unique_ship_list(item.get("ships", []))
+    if ship_name not in ships:
+        ships.append(ship_name)
+
+    notification_off_ships = unique_ship_list(item.get("notificationOffShips", []))
+    if enabled_bool:
+        notification_off_ships = [name for name in notification_off_ships if name != ship_name]
+    elif ship_name not in notification_off_ships:
+        notification_off_ships.append(ship_name)
+
+    item["ships"] = ships
+    item["notificationOffShips"] = [name for name in notification_off_ships if name in ships]
+    item["updatedAt"] = now_iso()
+    item["source"] = "set-ship-notification"
+    watch[token] = item
+    write_json(WATCH_FILE, watch)
+
+    summary = watch_summary(watch, token=token, ship_name=ship_name)
+    print(f"SET SHIP NOTIFICATION token={token[:12]}... ship={ship_name} enabled={enabled_bool} summary={summary}")
+
+    return jsonify({
+        "ok": True,
+        "shipName": ship_name,
+        "notificationEnabled": enabled_bool,
+        "notificationOffShips": item["notificationOffShips"],
+        "notificationOffCount": len(item["notificationOffShips"]),
         **summary,
         "time": now_iso(),
     })
@@ -2161,6 +2294,7 @@ def unregister_watch():
     payload = request.get_json(silent=True) or {}
     token = str(payload.get("token", "")).strip()
     ships = payload.get("ships", [])
+    notification_off_ships = notification_off_ship_list_from_payload(payload)
 
     if not token:
         return jsonify({"ok": False, "error": "token is required"}), 400
@@ -2168,11 +2302,13 @@ def unregister_watch():
         return jsonify({"ok": False, "error": "ships must be a list"}), 400
 
     normalized_ships = unique_ship_list(ships)
+    notification_off_ships = [name for name in notification_off_ships if name in normalized_ships]
     watch = read_json(WATCH_FILE, {})
 
     if normalized_ships:
         watch[token] = {
             "ships": normalized_ships,
+            "notificationOffShips": notification_off_ships,
             "updatedAt": now_iso(),
         }
     else:
@@ -2190,6 +2326,8 @@ def unregister_watch():
         "unregistered": True,
         "registeredShips": len(normalized_ships),
         "ships": normalized_ships,
+        "notificationOffShips": notification_off_ships,
+        "notificationOffCount": len(notification_off_ships),
         **summary,
         "time": now_iso(),
     })
@@ -2205,13 +2343,17 @@ def watch_status():
 
     watch = read_json(WATCH_FILE, {})
     my_ships = []
+    my_notification_off_ships = []
     if token and token in watch and isinstance(watch[token], dict):
         my_ships = unique_ship_list(watch[token].get("ships", []))
+        my_notification_off_ships = unique_ship_list(watch[token].get("notificationOffShips", []))
 
     summary = watch_summary(watch, token=token)
     return jsonify({
         "ok": True,
         "ships": my_ships,
+        "notificationOffShips": my_notification_off_ships,
+        "notificationOffCount": len(my_notification_off_ships),
         **summary,
         "time": now_iso(),
     })
@@ -2253,14 +2395,17 @@ def my_watch():
         watch = {}
 
     incoming_ships = extract_ship_list_from_payload(payload)
+    incoming_notification_off_ships = notification_off_ship_list_from_payload(payload)
     synced = False
 
     baseline_pending_added: List[str] = []
 
     # Render 재배포 후 /tmp 데이터가 비어도 앱이 로컬 SharedPreferences의 선박목록을 보내주면 즉시 복구합니다.
     if token and incoming_ships:
+        incoming_notification_off_ships = [name for name in incoming_notification_off_ships if name in incoming_ships]
         watch[token] = {
             "ships": incoming_ships,
+            "notificationOffShips": incoming_notification_off_ships,
             "updatedAt": now_iso(),
             "source": "my-watch-sync",
         }
@@ -2273,15 +2418,17 @@ def my_watch():
         synced = True
 
     my_ships = []
+    my_notification_off_ships = []
     if token and token in watch and isinstance(watch[token], dict):
         my_ships = unique_ship_list(watch[token].get("ships", []))
+        my_notification_off_ships = unique_ship_list(watch[token].get("notificationOffShips", []))
 
     summary = watch_summary(watch, token=token)
 
     print(
         f"MY WATCH token={token[:12]}... incoming={incoming_ships} "
         f"synced={synced} baselinePending={baseline_pending_added} "
-        f"myShips={my_ships} summary={summary}"
+        f"myShips={my_ships} notificationOff={my_notification_off_ships} summary={summary}"
     )
 
     return jsonify({
@@ -2289,6 +2436,8 @@ def my_watch():
         "synced": synced,
         "registered": synced,
         "ships": my_ships,
+        "notificationOffShips": my_notification_off_ships,
+        "notificationOffCount": len(my_notification_off_ships),
         "registeredShips": len(my_ships),
         "baselinePendingAdded": baseline_pending_added,
         "baselinePendingAddedCount": len(baseline_pending_added),
