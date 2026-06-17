@@ -19,6 +19,11 @@ except Exception:
     credentials = None
     messaging = None
 
+try:
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
+
 app = Flask(__name__)
 CORS(app)
 
@@ -31,12 +36,15 @@ EVENT_FILE = DATA_DIR / "event_history.json"
 AIS_ALERT_FILE = DATA_DIR / "ais_alert_state.json"
 AIS_SHIP_STATE_FILE = DATA_DIR / "ais_ship_state.json"
 AIS_BASELINE_FILE = DATA_DIR / "ais_baseline_pending.json"
+PORTMIS_FILE = DATA_DIR / "portmis_weekly.json"
+PORTMIS_BACKUP_FILE = DATA_DIR / "portmis_weekly_last_upload.json"
+
 
 AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "30"))
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "60"))
 
-SERVER_VERSION = "3.1.7-fairway-event-refine"
+SERVER_VERSION = "3.1.8-portmis-excel-upload"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
@@ -677,6 +685,342 @@ def pick_float(item: Dict[str, Any], keys: List[str], default: float = 0.0) -> f
         except Exception:
             continue
     return default
+
+
+# 3.1.8 Port-MIS 선박입출항현황 엑셀 업로드/파싱 기능
+# 수집 순서:
+# Port-MIS 선박입출항현황 → 50000개씩 보기 → 엑셀 다운로드 → /portmis/upload-excel 업로드
+# ETA 우선순위 정책:
+# 1순위 PORTWISE, 2순위 PORT-MIS. 이 서버 기능은 PORT-MIS ETA를 조기 예보값으로 저장합니다.
+PORTMIS_COLUMNS = [
+    ("portName", "항명"),
+    ("callSign", "호출부호"),
+    ("shipName", "선명"),
+    ("entryYear", "입항연도"),
+    ("entryCount", "입항횟수"),
+    ("requestType", "구분"),
+    ("inOutPortType", "외항/내항"),
+    ("movementType", "입출"),
+    ("grossTon", "총톤수"),
+    ("arrivalTime", "입항일시"),
+    ("departureTime", "출항일시"),
+    ("ciqProcessTime", "CIQ수속일자"),
+    ("permissionTime", "수리일시"),
+    ("voyageType", "항해구분"),
+    ("mrn", "MRN 번호"),
+    ("berthCode", "계선장소코드"),
+    ("berthSubCode", "계선장소세부코드"),
+    ("berthName", "계선장소명"),
+    ("nextPort", "차항지"),
+    ("previousPort", "전출항지"),
+    ("shipType", "선박용도"),
+    ("koreanCrewCount", "한국인/해기사 선원수"),
+    ("foreignCrewCount", "외국인/보통 선원수"),
+    ("passengerCount", "승객"),
+    ("tugYn", "예선"),
+    ("pilotYn", "도선"),
+    ("bargeCallSign1", "부선호출부호1"),
+    ("bargeCallSign2", "부선호출부호2"),
+]
+
+
+def normalize_ship_match_key(value: Any) -> str:
+    """
+    선박명 매칭용 키.
+    KEOYOUNG SUN 3 / KEOYOUNG SUN3처럼 공백/기호 차이를 줄이기 위해
+    영문/숫자/한글만 남기고 대문자로 통일합니다.
+    """
+    text = normalize_ship_name(value)
+    return "".join(ch for ch in text if ch.isalnum() or ("가" <= ch <= "힣"))
+
+
+def portmis_cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    text = str(value).strip()
+    if text.endswith(".0") and text.replace(".", "", 1).isdigit():
+        text = text[:-2]
+    return text
+
+
+def portmis_normalize_datetime(value: Any) -> str:
+    text = portmis_cell_text(value)
+    if not text:
+        return ""
+    # Excel이나 WebSquare에서 이미 "2026-06-17 13:00" 형태로 내려옵니다.
+    if len(text) >= 16 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:16]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 12:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]} {digits[8:10]}:{digits[10:12]}"
+    if len(digits) == 8:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
+    return text
+
+
+def portmis_normalize_date(value: Any) -> str:
+    text = portmis_cell_text(value)
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 8:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
+    return text
+
+
+def find_portmis_header_row(ws) -> int:
+    """
+    Port-MIS 다운로드 엑셀은 보통 12행이 컬럼명이고 13행부터 데이터입니다.
+    WebSquare가 만든 xlsx는 dimension 정보가 A1:A1로 잘못 들어오는 경우가 있어
+    ws.max_row에 의존하지 않고 앞 40행을 직접 순회합니다.
+    """
+    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=40, values_only=True), start=1):
+        values = [portmis_cell_text(value) for value in row]
+        joined = "|".join(values)
+        if "항명" in joined and "호출부호" in joined and "선명" in joined and "입항일시" in joined:
+            return row_idx
+    return 12
+
+
+def extract_portmis_excel_period(ws) -> Dict[str, str]:
+    result = {"from": "", "to": "", "printedAt": ""}
+    for row in ws.iter_rows(min_row=1, max_row=15, values_only=True):
+        line = " ".join(portmis_cell_text(v) for v in row if portmis_cell_text(v))
+        if "입출항시작일" in line:
+            result["from"] = portmis_normalize_date(line)
+        elif "입출항종료일" in line:
+            result["to"] = portmis_normalize_date(line)
+        elif "출력일자" in line:
+            result["printedAt"] = portmis_normalize_date(line)
+    return result
+
+
+def parse_portmis_excel_file(file_obj: Any) -> Dict[str, Any]:
+    if load_workbook is None:
+        raise RuntimeError("openpyxl 패키지가 없습니다. requirements.txt에 openpyxl==3.1.5 를 추가하세요.")
+
+    wb = load_workbook(file_obj, read_only=True, data_only=True)
+    ws = wb.active
+
+    # Port-MIS WebSquare 엑셀은 파일 dimension이 A1:A1로 저장되는 경우가 있어
+    # reset_dimensions() 후 iter_rows 전체 순회 방식으로 읽어야 2000+행 전체가 잡힙니다.
+    try:
+        ws.reset_dimensions()
+    except Exception:
+        pass
+
+    header_row = find_portmis_header_row(ws)
+    period = extract_portmis_excel_period(ws)
+
+    items: List[Dict[str, Any]] = []
+    seen_record_keys = set()
+
+    for row_idx, row in enumerate(
+        ws.iter_rows(min_row=header_row + 1, values_only=True),
+        start=header_row + 1,
+    ):
+        raw_values = [portmis_cell_text(v) for v in row[:len(PORTMIS_COLUMNS)]]
+        if not any(raw_values):
+            continue
+
+        # 상단/하단 메모나 깨진 행 방지
+        port_name = raw_values[0] if len(raw_values) > 0 else ""
+        ship_name = raw_values[2] if len(raw_values) > 2 else ""
+        if not ship_name or ship_name in ("선명", "선박입출항현황"):
+            continue
+
+        item: Dict[str, Any] = {}
+        for index, (field, _label) in enumerate(PORTMIS_COLUMNS):
+            item[field] = raw_values[index] if index < len(raw_values) else ""
+
+        item["portName"] = portmis_cell_text(item.get("portName"))
+        item["callSign"] = portmis_cell_text(item.get("callSign")).upper()
+        item["shipName"] = portmis_cell_text(item.get("shipName")).upper()
+        item["shipNameRaw"] = portmis_cell_text(raw_values[2] if len(raw_values) > 2 else "")
+        item["normalizedShipName"] = normalize_ship_name(item["shipName"])
+        item["shipMatchKey"] = normalize_ship_match_key(item["shipName"])
+        item["arrivalTime"] = portmis_normalize_datetime(item.get("arrivalTime"))
+        item["departureTime"] = portmis_normalize_datetime(item.get("departureTime"))
+        item["ciqProcessTime"] = portmis_normalize_datetime(item.get("ciqProcessTime"))
+        item["permissionTime"] = portmis_normalize_datetime(item.get("permissionTime"))
+        item["source"] = "PORT_MIS_EXCEL"
+        item["sourcePriority"] = 2
+        item["rowNumber"] = row_idx
+
+        movement = str(item.get("movementType") or "").strip()
+        if movement == "입항" and item.get("arrivalTime"):
+            item["portmisEta"] = item.get("arrivalTime", "")
+            item["eta"] = item.get("arrivalTime", "")
+            item["etaSource"] = "PORT_MIS"
+            item["etaPriority"] = 2
+            item["confidence"] = "PLANNED"
+        else:
+            item["portmisEta"] = ""
+            item["eta"] = ""
+            item["etaSource"] = ""
+            item["etaPriority"] = 0
+            item["confidence"] = "RECORD"
+
+        record_key = "::".join([
+            item.get("portName", ""),
+            item.get("callSign", ""),
+            item.get("shipMatchKey", ""),
+            item.get("entryYear", ""),
+            item.get("entryCount", ""),
+            item.get("movementType", ""),
+            item.get("arrivalTime", ""),
+            item.get("departureTime", ""),
+        ])
+        if record_key in seen_record_keys:
+            continue
+        seen_record_keys.add(record_key)
+        items.append(item)
+
+    wb.close()
+
+    uploaded_at = now_iso()
+    port_counts: Dict[str, int] = {}
+    movement_counts: Dict[str, int] = {}
+    for item in items:
+        port = str(item.get("portName") or "미상")
+        movement = str(item.get("movementType") or "미상")
+        port_counts[port] = port_counts.get(port, 0) + 1
+        movement_counts[movement] = movement_counts.get(movement, 0) + 1
+
+    return {
+        "ok": True,
+        "source": "PORT_MIS_EXCEL",
+        "version": SERVER_VERSION,
+        "uploadedAt": uploaded_at,
+        "from": period.get("from", ""),
+        "to": period.get("to", ""),
+        "printedAt": period.get("printedAt", ""),
+        "sheetName": ws.title,
+        "headerRow": header_row,
+        "count": len(items),
+        "portCounts": dict(sorted(port_counts.items(), key=lambda kv: kv[0])),
+        "movementCounts": dict(sorted(movement_counts.items(), key=lambda kv: kv[0])),
+        "etaPolicy": {
+            "representativeEtaPriority": ["PORTWISE", "PORT_MIS"],
+            "portmisPriority": 2,
+            "description": "PORT-MIS는 1~2주 전 조기 입항예정/선석회의 기반 데이터로 사용하고, PORTWISE ETA가 있으면 대표 ETA는 PORTWISE로 교체합니다.",
+        },
+        "items": items,
+    }
+
+
+def portmis_status_payload(include_items: bool = False) -> Dict[str, Any]:
+    data = read_json(PORTMIS_FILE, {})
+    if not isinstance(data, dict) or not data:
+        return {
+            "ok": True,
+            "available": False,
+            "source": "PORT_MIS_EXCEL",
+            "count": 0,
+            "message": "아직 업로드된 Port-MIS 엑셀 데이터가 없습니다.",
+            "time": now_iso(),
+        }
+
+    payload = {
+        "ok": True,
+        "available": True,
+        "source": data.get("source", "PORT_MIS_EXCEL"),
+        "uploadedAt": data.get("uploadedAt", ""),
+        "from": data.get("from", ""),
+        "to": data.get("to", ""),
+        "printedAt": data.get("printedAt", ""),
+        "count": int(data.get("count") or len(data.get("items", []) if isinstance(data.get("items"), list) else [])),
+        "portCounts": data.get("portCounts", {}),
+        "movementCounts": data.get("movementCounts", {}),
+        "etaPolicy": data.get("etaPolicy", {}),
+        "time": now_iso(),
+    }
+    if include_items:
+        payload["items"] = data.get("items", []) if isinstance(data.get("items"), list) else []
+    return payload
+
+
+def portmis_filtered_items(args: Dict[str, Any]) -> Dict[str, Any]:
+    data = read_json(PORTMIS_FILE, {})
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return {
+            "ok": True,
+            "available": False,
+            "count": 0,
+            "items": [],
+            "message": "아직 업로드된 Port-MIS 엑셀 데이터가 없습니다.",
+            "time": now_iso(),
+        }
+
+    items = [item for item in data.get("items", []) if isinstance(item, dict)]
+    original_count = len(items)
+
+    port = str(args.get("port") or "").strip()
+    if port:
+        items = [item for item in items if port in str(item.get("portName") or "")]
+
+    movement = str(args.get("movement") or args.get("movementType") or "").strip()
+    if movement:
+        items = [item for item in items if movement == str(item.get("movementType") or "").strip()]
+
+    ship_query = str(args.get("ship") or args.get("shipName") or "").strip()
+    if ship_query:
+        q_key = normalize_ship_match_key(ship_query)
+        items = [
+            item for item in items
+            if q_key in str(item.get("shipMatchKey") or "") or ship_query.upper() in str(item.get("shipName") or "")
+        ]
+
+    tracked_only = str(args.get("trackedOnly") or args.get("tracked") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    token = str(args.get("token") or "").strip()
+    tracked_keys = set()
+    if tracked_only:
+        watch = read_json(WATCH_FILE, {})
+        if isinstance(watch, dict):
+            if token and isinstance(watch.get(token), dict):
+                tracked_keys.update(normalize_ship_match_key(name) for name in unique_ship_list(watch[token].get("ships", [])))
+            else:
+                for _device_token, entry in watch.items():
+                    if isinstance(entry, dict):
+                        tracked_keys.update(normalize_ship_match_key(name) for name in unique_ship_list(entry.get("ships", [])))
+        tracked_keys.discard("")
+        items = [item for item in items if str(item.get("shipMatchKey") or "") in tracked_keys]
+
+    eta_only = str(args.get("etaOnly") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    if eta_only:
+        items = [item for item in items if str(item.get("movementType") or "").strip() == "입항" and item.get("arrivalTime")]
+
+    try:
+        limit = int(args.get("limit") or 0)
+    except Exception:
+        limit = 0
+    if limit > 0:
+        items = items[:limit]
+
+    return {
+        "ok": True,
+        "available": True,
+        "source": data.get("source", "PORT_MIS_EXCEL"),
+        "uploadedAt": data.get("uploadedAt", ""),
+        "from": data.get("from", ""),
+        "to": data.get("to", ""),
+        "printedAt": data.get("printedAt", ""),
+        "originalCount": original_count,
+        "count": len(items),
+        "filters": {
+            "port": port,
+            "movement": movement,
+            "ship": ship_query,
+            "trackedOnly": tracked_only,
+            "tokenScoped": bool(token),
+            "etaOnly": eta_only,
+            "limit": limit,
+        },
+        "etaPolicy": data.get("etaPolicy", {}),
+        "items": items,
+        "time": now_iso(),
+    }
+
 
 
 @app.before_request
@@ -2612,6 +2956,132 @@ def clear_alert_history():
         "message": "alert history, duplicate state, ais ship state, baseline pending cleared",
         "time": now_iso(),
     })
+
+
+@app.post("/portmis/upload-excel")
+def portmis_upload_excel():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    if load_workbook is None:
+        return jsonify({
+            "ok": False,
+            "error": "openpyxl not installed",
+            "message": "requirements.txt에 openpyxl==3.1.5 를 추가한 뒤 Render를 재배포하세요.",
+        }), 500
+
+    upload = request.files.get("file") or request.files.get("excel") or request.files.get("xlsx")
+    if upload is None:
+        return jsonify({
+            "ok": False,
+            "error": "excel file is required",
+            "message": "multipart/form-data 형식으로 file 필드에 Port-MIS download.xlsx를 업로드하세요.",
+        }), 400
+
+    filename = str(getattr(upload, "filename", "") or "download.xlsx")
+    if not filename.lower().endswith((".xlsx", ".xlsm", ".xltx", ".xltm")):
+        return jsonify({
+            "ok": False,
+            "error": "invalid file type",
+            "filename": filename,
+            "message": "Port-MIS 엑셀 .xlsx 파일만 업로드하세요.",
+        }), 400
+
+    try:
+        parsed = parse_portmis_excel_file(upload)
+        parsed["uploadedFilename"] = filename
+
+        previous = read_json(PORTMIS_FILE, {})
+        if isinstance(previous, dict) and previous:
+            write_json(PORTMIS_BACKUP_FILE, previous)
+
+        write_json(PORTMIS_FILE, parsed)
+
+        return jsonify({
+            "ok": True,
+            "message": "Port-MIS 엑셀 업로드/파싱 완료",
+            "source": parsed.get("source"),
+            "from": parsed.get("from"),
+            "to": parsed.get("to"),
+            "uploadedAt": parsed.get("uploadedAt"),
+            "count": parsed.get("count"),
+            "portCounts": parsed.get("portCounts", {}),
+            "movementCounts": parsed.get("movementCounts", {}),
+            "etaPolicy": parsed.get("etaPolicy", {}),
+            "sample": parsed.get("items", [])[:3],
+            "time": now_iso(),
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": "failed to parse Port-MIS excel",
+            "detail": str(exc),
+            "time": now_iso(),
+        }), 500
+
+
+@app.get("/portmis/status")
+def portmis_status():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+    return jsonify(portmis_status_payload(include_items=False))
+
+
+@app.get("/portmis/weekly")
+def portmis_weekly():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+    return jsonify(portmis_filtered_items(request.args))
+
+
+@app.get("/portmis/ships")
+def portmis_ships():
+    if not require_api_key():
+        return jsonify({"ok": False, "error": "invalid api key"}), 401
+
+    result = portmis_filtered_items(request.args)
+    if not result.get("available"):
+        return jsonify(result)
+
+    ships = []
+    seen = set()
+    for item in result.get("items", []):
+        key = str(item.get("shipMatchKey") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ships.append({
+            "shipName": item.get("shipName", ""),
+            "shipNameRaw": item.get("shipNameRaw", ""),
+            "callSign": item.get("callSign", ""),
+            "portName": item.get("portName", ""),
+            "movementType": item.get("movementType", ""),
+            "arrivalTime": item.get("arrivalTime", ""),
+            "departureTime": item.get("departureTime", ""),
+            "portmisEta": item.get("portmisEta", ""),
+            "eta": item.get("eta", ""),
+            "etaSource": item.get("etaSource", ""),
+            "etaPriority": item.get("etaPriority", 0),
+            "berthName": item.get("berthName", ""),
+            "nextPort": item.get("nextPort", ""),
+            "previousPort": item.get("previousPort", ""),
+            "shipType": item.get("shipType", ""),
+            "pilotYn": item.get("pilotYn", ""),
+        })
+
+    return jsonify({
+        "ok": True,
+        "available": True,
+        "source": result.get("source"),
+        "uploadedAt": result.get("uploadedAt"),
+        "from": result.get("from"),
+        "to": result.get("to"),
+        "count": len(ships),
+        "etaPolicy": result.get("etaPolicy", {}),
+        "ships": ships,
+        "time": now_iso(),
+    })
+
 
 
 @app.get("/zone-test")
