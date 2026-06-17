@@ -36,7 +36,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "60"))
 
-SERVER_VERSION = "3.1.5-per-ship-notification-toggle"
+SERVER_VERSION = "3.1.6-berth-passby-noise-filter"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
@@ -1564,6 +1564,16 @@ def is_berth_area(location: str) -> bool:
     return any(keyword.upper() in value for keyword in berth_keywords)
 
 
+def is_buoy_area(location: str) -> bool:
+    """SK/S-OIL 부이처럼 실제 계류 알림을 유지해야 하는 구역인지 판단합니다."""
+    value = str(location or "").upper()
+    return "부이" in str(location or "") or "BUOY" in value
+
+
+def is_same_zone(a: str, b: str) -> bool:
+    return normalize_zone_id(a) == normalize_zone_id(b)
+
+
 def is_anchorage_area(location: str) -> bool:
     value = str(location or "").upper().replace(" ", "")
     if "묘지" in value or "묘박" in value or "정박지" in value or "ANCHOR" in value:
@@ -1761,6 +1771,14 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
     berth_zone_id = normalize_zone_id(berth_zone)
     anchorage_zone_id = normalize_zone_id(anchorage_zone)
 
+    previous_berth_area = is_berth_area(previous_location) if has_previous else False
+    previous_anchorage_area = is_anchorage_area(previous_location) if has_previous else False
+    previous_berth_zone = berth_zone_label(previous_location) if has_previous else ""
+    previous_anchorage_zone = anchorage_zone_label(previous_location) if has_previous else ""
+    same_berth_zone = bool(has_previous and previous_berth_area and berth_area and is_same_zone(previous_berth_zone, berth_zone))
+    same_anchorage_zone = bool(has_previous and previous_anchorage_area and anchorage_area and is_same_zone(previous_anchorage_zone, anchorage_zone))
+    current_is_buoy = is_buoy_area(berth_zone)
+
     current_status_upper = current_status.upper()
     berth_completed_status = (
         "MOORED" in current_status_upper
@@ -1775,8 +1793,10 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
     departure_event_added = False
     flow_event_added = False
 
-    # 부두/부이 접근중: 부두권 또는 부이권에서 0.5~1.0kn 저속 접근.
-    if berth_area and 0.5 <= current_speed <= 1.0:
+    # 부두 접근중 알림은 통로를 지나가며 인접 부두가 계속 바뀌는 경우 알림이 과도하게 발생했습니다.
+    # 그래서 일반 부두는 "접근중" 푸시를 보내지 않고, 실제로 정지/접안이 확인된 "접안완료"만 보냅니다.
+    # 단, SK/S-OIL 부이 계류중은 통로 부두 통과 문제가 상대적으로 적어 기존 접근중 알림을 유지합니다.
+    if berth_area and current_is_buoy and 0.5 <= current_speed <= 1.0:
         words = facility_action_words(berth_zone)
         events.append({
             "eventType": f"berth_approaching:{berth_zone_id}",
@@ -1786,7 +1806,10 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         special_event_added = True
 
     # 부두/부이 완료: 부두권 또는 부이권 + 0.1kn 이하 + 정박/접안/MOORED 계열 상태.
-    if berth_area and current_speed <= 0.1 and berth_completed_status:
+    # 일반 부두는 같은 부두 구역이 연속으로 확인된 뒤에만 접안완료를 발송해,
+    # SK1로 들어가는 중 SK2/SK3 등 인접 부두를 잠깐 스친 것을 접안으로 오판하지 않게 합니다.
+    berth_completed_zone_confirmed = current_is_buoy or same_berth_zone or previous_flow_stage in ("BERTH_NEAR_STOPPED", "BERTH_COMPLETED")
+    if berth_area and current_speed <= 0.1 and berth_completed_status and berth_completed_zone_confirmed:
         words = facility_action_words(berth_zone)
         events.append({
             "eventType": f"berth_completed:{berth_zone_id}",
@@ -1858,7 +1881,29 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
             "body": f"{name} 상태가 {previous_status} → {current_status} 로 변경되었습니다.\n{flow_summary_line(current)}",
         })
 
-    if has_previous and not major_event_added and previous_location != current_location and current_location != "위치 확인중":
+    berth_passby_location_change = (
+        has_previous
+        and previous_berth_area
+        and berth_area
+        and previous_location != current_location
+        and not now_stopped
+    )
+    berth_entry_passby_location_change = (
+        has_previous
+        and berth_area
+        and not current_is_buoy
+        and previous_location != current_location
+        and current_speed > 0.2
+        and not now_stopped
+    )
+    if (
+        has_previous
+        and not major_event_added
+        and previous_location != current_location
+        and current_location != "위치 확인중"
+        and not berth_passby_location_change
+        and not berth_entry_passby_location_change
+    ):
         events.append({
             "eventType": f"location_changed:{current_location}",
             "title": f"📍 {name} 위치 변화",
