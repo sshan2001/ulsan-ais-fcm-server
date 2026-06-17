@@ -36,7 +36,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "60"))
 
-SERVER_VERSION = "3.1.6-berth-passby-noise-filter"
+SERVER_VERSION = "3.1.7-fairway-event-refine"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
@@ -1570,6 +1570,35 @@ def is_buoy_area(location: str) -> bool:
     return "부이" in str(location or "") or "BUOY" in value
 
 
+def is_fairway_area(location: str) -> bool:
+    """제1/2/3항로처럼 실제 선박 이동 경로인 항로인지 판단합니다.
+
+    외항/접근해역도 zoneType은 route 계열로 다루지만,
+    푸시 알림에서 말하는 '항로 진입'은 제1항로/제2항로/제3항로 진입만 의미합니다.
+    """
+    value = str(location or "").replace(" ", "")
+    return (
+        "제1항로" in value
+        or "제2항로" in value
+        or "제3항로" in value
+        or "1항로" in value
+        or "2항로" in value
+        or "3항로" in value
+    )
+
+
+def is_facility_area(location: str) -> bool:
+    """부두/묘박지/부이처럼 선박이 머물 수 있는 시설성 구역인지 판단합니다."""
+    return is_berth_area(location) or is_anchorage_area(location)
+
+
+def fairway_zone_label(location: str) -> str:
+    value = str(location or "").strip()
+    if not value or value == "위치 확인중":
+        return "항로"
+    return value
+
+
 def is_same_zone(a: str, b: str) -> bool:
     return normalize_zone_id(a) == normalize_zone_id(b)
 
@@ -1779,6 +1808,12 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
     same_anchorage_zone = bool(has_previous and previous_anchorage_area and anchorage_area and is_same_zone(previous_anchorage_zone, anchorage_zone))
     current_is_buoy = is_buoy_area(berth_zone)
 
+    current_fairway_area = is_fairway_area(current_location)
+    previous_fairway_area = is_fairway_area(previous_location) if has_previous else False
+    fairway_zone = fairway_zone_label(current_location)
+    fairway_zone_id = normalize_zone_id(fairway_zone)
+    previous_facility_area = is_facility_area(previous_location) if has_previous else False
+
     current_status_upper = current_status.upper()
     berth_completed_status = (
         "MOORED" in current_status_upper
@@ -1836,23 +1871,52 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         })
         special_event_added = True
 
-    # 정박/접안/투묘 상태에서 항해 상태로 바뀌면 출항 흐름으로 우선 알림.
+    # 정박/접안/투묘/계류 상태에서 항로로 이동하면 출항 흐름으로 우선 알림.
+    # 항로는 선박이 머무는 곳이 아니라 이동 경로이므로, 시설 구역에서 항로로 나오는 변화는 의미 있는 이벤트입니다.
     if has_previous and prev_stopped and now_underway:
-        events.append({
-            "eventType": "departure_detected",
-            "title": f"🔔 {name} 출항 · 항로 이동",
-            "body": f"{name} 선박이 {previous_location}에서 이동을 시작했습니다.\n📍 현재 구역: {current_location}\n🧭 흐름: 정박/접안 → 출항 → 항로 이동\n⚡ 현재 속도: {current_speed:.1f} kn",
-        })
+        if current_fairway_area and previous_facility_area:
+            events.append({
+                "eventType": f"departure_to_fairway:{fairway_zone_id}",
+                "title": f"🔔 {name} 출항 후 항로 이동",
+                "body": f"{name} 선박이 {previous_location}에서 이탈하여 {fairway_zone}로 이동 중입니다.\n📍 현재 구역: {current_location}\n⚡ 현재 속도: {current_speed:.1f} kn",
+            })
+        else:
+            events.append({
+                "eventType": "departure_detected",
+                "title": f"🔔 {name} 출항 · 항로 이동",
+                "body": f"{name} 선박이 {previous_location}에서 이동을 시작했습니다.\n📍 현재 구역: {current_location}\n🧭 흐름: 정박/접안 → 출항 → 항로 이동\n⚡ 현재 속도: {current_speed:.1f} kn",
+            })
         departure_event_added = True
 
-    # 항로/접근 해역 진입은 특수 이벤트가 아닐 때만 일반 흐름 이벤트로 기록.
+    # 외항/접근해역/넓은 해역에서 제1·2·3항로로 들어온 경우에는 항로 진입 알림을 명확하게 발송합니다.
+    # 단, 앱 사용자가 이미 항로 위의 선박을 처음 등록한 경우는 baseline 로직에서 기준값만 저장하므로 폭주하지 않습니다.
+    fairway_entry_event = (
+        has_previous
+        and not special_event_added
+        and not departure_event_added
+        and current_fairway_area
+        and not previous_fairway_area
+        and current_speed >= 3.0
+    )
+    if fairway_entry_event:
+        events.append({
+            "eventType": f"fairway_entered:{fairway_zone_id}",
+            "title": f"🧭 {name} {fairway_zone} 진입",
+            "body": f"{name} 선박이 울산항 {fairway_zone}로 진입했습니다.\n📍 이전 구역: {previous_location}\n📍 현재 구역: {current_location}\n⚡ 속도: {current_speed:.1f} kn",
+        })
+        flow_event_added = True
+
+    # 일반 항로/접근 흐름 이벤트.
+    # 제1항로→제2항로처럼 항로 안에서의 세부 이동은 푸시를 최소화하기 위해 보내지 않습니다.
     if (
         has_previous
         and not special_event_added
         and not departure_event_added
+        and not flow_event_added
         and current_flow_stage in ("PORT_APPROACH", "ROUTE_MOVING")
         and previous_flow_stage != current_flow_stage
         and current_speed >= 3.0
+        and not (current_fairway_area and previous_fairway_area)
     ):
         events.append({
             "eventType": f"flow_stage:{current_flow_stage}",
@@ -1896,6 +1960,13 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         and current_speed > 0.2
         and not now_stopped
     )
+    fairway_internal_location_change = (
+        has_previous
+        and previous_fairway_area
+        and current_fairway_area
+        and previous_location != current_location
+        and current_speed >= 1.0
+    )
     if (
         has_previous
         and not major_event_added
@@ -1903,6 +1974,7 @@ def detect_ship_events(ship_name: str, current: Dict[str, Any], previous: Dict[s
         and current_location != "위치 확인중"
         and not berth_passby_location_change
         and not berth_entry_passby_location_change
+        and not fairway_internal_location_change
     ):
         events.append({
             "eventType": f"location_changed:{current_location}",
