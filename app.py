@@ -44,7 +44,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "60"))
 
-SERVER_VERSION = "3.1.8-portmis-excel-upload"
+SERVER_VERSION = "3.1.9-portmis-header-parser"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
@@ -904,6 +904,315 @@ def parse_portmis_excel_file(file_obj: Any) -> Dict[str, Any]:
             "representativeEtaPriority": ["PORTWISE", "PORT_MIS"],
             "portmisPriority": 2,
             "description": "PORT-MIS는 1~2주 전 조기 입항예정/선석회의 기반 데이터로 사용하고, PORTWISE ETA가 있으면 대표 ETA는 PORTWISE로 교체합니다.",
+        },
+        "items": items,
+    }
+
+
+# 3.1.9 Port-MIS auto-download xlsx header parser.
+# Latest auto collector files have header row at row 12 and 41 columns from A to AO.
+PORTMIS_HEADER_SPECS = [
+    {"field": "portName", "position": 1, "labels": ["항명"]},
+    {"field": "callSign", "position": 2, "labels": ["호출부호"]},
+    {"field": "shipName", "position": 3, "labels": ["선명"]},
+    {"field": "entryYear", "position": 4, "labels": ["입항년도", "입항횟수"]},
+    {"field": "entryCount", "position": 5, "labels": ["입항횟수"]},
+    {"field": "requestType", "position": 6, "labels": ["구분"]},
+    {"field": "inOutPortType", "position": 7, "labels": ["외내"]},
+    {"field": "movementType", "position": 8, "labels": ["입출"]},
+    {"field": "grossTon", "position": 9, "labels": ["총톤수"]},
+    {"field": "internationalTon", "position": 10, "labels": ["국제톤수"]},
+    {"field": "billingTon", "position": 11, "labels": ["징수톤수"]},
+    {"field": "arrivalTime", "position": 12, "labels": ["입항일시"]},
+    {"field": "departureTime", "position": 13, "labels": ["출항일시"]},
+    {"field": "ciqProcessTime", "position": 14, "labels": ["CIQ수속일자"]},
+    {"field": "permissionTime", "position": 15, "labels": ["수리일시"]},
+    {"field": "purpose", "position": 16, "labels": ["입항목적"]},
+    {"field": "voyageType", "position": 17, "labels": ["항해구분"]},
+    {"field": "mrn", "position": 18, "labels": ["MRN번호", "MRN"]},
+    {"field": "cargoType", "position": 19, "labels": ["적재화물"]},
+    {"field": "cargoTon", "position": 20, "labels": ["적재톤수"]},
+    {"field": "nationalityCode", "position": 21, "labels": ["국적코드"]},
+    {"field": "nationalityName", "position": 22, "labels": ["국적명"]},
+    {"field": "berthCode", "position": 23, "labels": ["계선장소코드"]},
+    {"field": "berthSubCode", "position": 24, "labels": ["계선장소번호"]},
+    {"field": "berthName", "position": 25, "labels": ["계선장소명"]},
+    {"field": "discountRate", "position": 26, "labels": ["할인율"]},
+    {"field": "discountReason", "position": 27, "labels": ["할인사유"]},
+    {"field": "nextPort", "position": 28, "labels": ["차항지"]},
+    {"field": "previousPort", "position": 29, "labels": ["전출항지"]},
+    {"field": "shippingCompanyCode", "position": 30, "labels": ["선사코드"]},
+    {"field": "shippingCompanyName", "position": 31, "labels": ["선사명"]},
+    {"field": "agentCode", "position": 32, "labels": ["대리점코드"]},
+    {"field": "agentName", "position": 33, "labels": ["대리점명"]},
+    {"field": "shipType", "position": 34, "labels": ["선박용도"]},
+    {"field": "koreanCrewCount", "position": 35, "labels": ["한국인선원수", "해기사선원수"]},
+    {"field": "foreignCrewCount", "position": 36, "labels": ["외국인선원수", "보통선원수"]},
+    {"field": "passengerCount", "position": 37, "labels": ["승객"]},
+    {"field": "tugYn", "position": 38, "labels": ["예선"]},
+    {"field": "pilotYn", "position": 39, "labels": ["도선"]},
+    {"field": "bargeCallSign1", "position": 40, "labels": ["부선호출부호1"]},
+    {"field": "bargeCallSign2", "position": 41, "labels": ["부선호출부호2"]},
+]
+
+
+def portmis_header_key(value: Any) -> str:
+    text = portmis_cell_text(value)
+    for old, new in (
+        ("\n", ""),
+        ("\r", ""),
+        ("\t", ""),
+        (" ", ""),
+        ("/", ""),
+        (":", ""),
+        ("(", ""),
+        (")", ""),
+        ("<br/>", ""),
+        ("<br>", ""),
+    ):
+        text = text.replace(old, new)
+    return text.upper()
+
+
+def portmis_header_matches(header_value: Any, labels: List[str]) -> bool:
+    header = portmis_header_key(header_value)
+    if not header:
+        return False
+    for label in labels:
+        key = portmis_header_key(label)
+        if key and (key in header or header in key):
+            return True
+    return False
+
+
+def portmis_header_row_values(ws, row_idx: int) -> List[str]:
+    row = next(ws.iter_rows(min_row=row_idx, max_row=row_idx, values_only=True), [])
+    return [portmis_cell_text(value) for value in row]
+
+
+def portmis_row_looks_like_header(values: List[str]) -> bool:
+    joined = "|".join(portmis_header_key(value) for value in values)
+    return all(token in joined for token in ("항명", "호출부호", "선명", "입출"))
+
+
+def find_portmis_header_row(ws) -> int:
+    row12 = portmis_header_row_values(ws, 12)
+    if portmis_row_looks_like_header(row12):
+        return 12
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=40, values_only=True), start=1):
+        values = [portmis_cell_text(value) for value in row]
+        if portmis_row_looks_like_header(values):
+            return row_idx
+    return 12
+
+
+def build_portmis_column_indexes(headers: List[str]) -> Dict[str, int]:
+    indexes: Dict[str, int] = {}
+    used = set()
+
+    for spec in PORTMIS_HEADER_SPECS:
+        field = str(spec["field"])
+        labels = list(spec["labels"])
+        preferred = int(spec["position"]) - 1
+
+        if preferred < len(headers) and portmis_header_matches(headers[preferred], labels):
+            indexes[field] = preferred
+            used.add(preferred)
+            continue
+
+        found = None
+        for idx, header in enumerate(headers):
+            if idx in used:
+                continue
+            if portmis_header_matches(header, labels):
+                found = idx
+                break
+
+        if found is None:
+            found = preferred
+
+        indexes[field] = found
+        used.add(found)
+
+    return indexes
+
+
+def portmis_get_by_index(values: List[str], index: int) -> str:
+    if index < 0 or index >= len(values):
+        return ""
+    return portmis_cell_text(values[index])
+
+
+def normalize_ship_match_key(value: Any) -> str:
+    text = normalize_ship_name(value)
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def portmis_date_part(value: Any) -> str:
+    text = portmis_normalize_datetime(value)
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:10]
+    return ""
+
+
+def extract_portmis_excel_period(ws) -> Dict[str, str]:
+    result = {"from": "", "to": "", "printedAt": ""}
+    for row in ws.iter_rows(min_row=1, max_row=15, values_only=True):
+        line = " ".join(portmis_cell_text(v) for v in row if portmis_cell_text(v))
+        if not line:
+            continue
+        normalized = portmis_header_key(line)
+        if "시작" in normalized or "FROM" in normalized:
+            result["from"] = portmis_normalize_date(line)
+        elif "종료" in normalized or "TO" in normalized:
+            result["to"] = portmis_normalize_date(line)
+        elif "출력" in normalized or "PRINT" in normalized:
+            result["printedAt"] = portmis_normalize_date(line)
+    return result
+
+
+def parse_portmis_excel_file(file_obj: Any) -> Dict[str, Any]:
+    if load_workbook is None:
+        raise RuntimeError("openpyxl 패키지가 없습니다. requirements.txt에 openpyxl==3.1.5 를 추가하세요.")
+
+    wb = load_workbook(file_obj, read_only=True, data_only=True)
+    ws = wb.active
+    try:
+        ws.reset_dimensions()
+    except Exception:
+        pass
+
+    header_row = find_portmis_header_row(ws)
+    headers = portmis_header_row_values(ws, header_row)
+    column_indexes = build_portmis_column_indexes(headers)
+    period = extract_portmis_excel_period(ws)
+
+    items: List[Dict[str, Any]] = []
+    seen_record_keys = set()
+    blank_streak = 0
+
+    for row_idx, row in enumerate(
+        ws.iter_rows(min_row=header_row + 1, values_only=True),
+        start=header_row + 1,
+    ):
+        raw_values = [portmis_cell_text(v) for v in row]
+        if not any(raw_values):
+            blank_streak += 1
+            if blank_streak >= 50 and items:
+                break
+            continue
+        blank_streak = 0
+
+        item: Dict[str, Any] = {}
+        for spec in PORTMIS_HEADER_SPECS:
+            field = str(spec["field"])
+            item[field] = portmis_get_by_index(raw_values, column_indexes.get(field, -1))
+
+        ship_name_raw = portmis_cell_text(item.get("shipName"))
+        port_name = portmis_cell_text(item.get("portName"))
+        if not ship_name_raw or portmis_header_matches(ship_name_raw, ["선명"]):
+            continue
+        if not port_name or portmis_header_matches(port_name, ["항명"]):
+            continue
+
+        item["portName"] = port_name
+        item["callSign"] = portmis_cell_text(item.get("callSign")).upper()
+        item["shipNameRaw"] = ship_name_raw
+        item["shipName"] = ship_name_raw.upper()
+        item["normalizedShipName"] = normalize_ship_name(item["shipName"])
+        item["shipMatchKey"] = normalize_ship_match_key(item["shipName"])
+
+        item["arrivalTime"] = portmis_normalize_datetime(item.get("arrivalTime"))
+        item["departureTime"] = portmis_normalize_datetime(item.get("departureTime"))
+        item["ciqProcessTime"] = portmis_normalize_datetime(item.get("ciqProcessTime"))
+        item["permissionTime"] = portmis_normalize_datetime(item.get("permissionTime"))
+
+        item["source"] = "PORT_MIS_EXCEL"
+        item["sourcePriority"] = 2
+        item["rowNumber"] = row_idx
+
+        movement = str(item.get("movementType") or "").strip()
+        if "입항" in movement and item.get("arrivalTime"):
+            item["portmisEta"] = item.get("arrivalTime", "")
+            item["eta"] = item.get("arrivalTime", "")
+            item["etaSource"] = "PORT_MIS"
+            item["etaPriority"] = 2
+            item["confidence"] = "PLANNED"
+        elif "출항" in movement:
+            item["portmisEta"] = ""
+            item["eta"] = ""
+            item["etaSource"] = ""
+            item["etaPriority"] = 0
+            item["confidence"] = "DEPARTURE_RECORD"
+        else:
+            item["portmisEta"] = ""
+            item["eta"] = ""
+            item["etaSource"] = ""
+            item["etaPriority"] = 0
+            item["confidence"] = "RECORD"
+
+        record_key = "::".join([
+            item.get("portName", ""),
+            item.get("callSign", ""),
+            item.get("shipMatchKey", ""),
+            item.get("entryYear", ""),
+            item.get("entryCount", ""),
+            item.get("movementType", ""),
+            item.get("arrivalTime", ""),
+            item.get("departureTime", ""),
+        ])
+        if record_key in seen_record_keys:
+            continue
+        seen_record_keys.add(record_key)
+        items.append(item)
+
+    sheet_name = ws.title
+    wb.close()
+
+    date_parts = []
+    for item in items:
+        movement = str(item.get("movementType") or "").strip()
+        fields = ["arrivalTime"] if "입항" in movement else ["departureTime"] if "출항" in movement else ["arrivalTime", "departureTime"]
+        for field in fields:
+            part = portmis_date_part(item.get(field))
+            if part:
+                date_parts.append(part)
+    if date_parts:
+        if not period.get("from"):
+            period["from"] = min(date_parts)
+        if not period.get("to"):
+            period["to"] = max(date_parts)
+
+    uploaded_at = now_iso()
+    port_counts: Dict[str, int] = {}
+    movement_counts: Dict[str, int] = {}
+    for item in items:
+        port = str(item.get("portName") or "미상")
+        movement = str(item.get("movementType") or "미상")
+        port_counts[port] = port_counts.get(port, 0) + 1
+        movement_counts[movement] = movement_counts.get(movement, 0) + 1
+
+    return {
+        "ok": True,
+        "source": "PORT_MIS_EXCEL",
+        "version": SERVER_VERSION,
+        "uploadedAt": uploaded_at,
+        "from": period.get("from", ""),
+        "to": period.get("to", ""),
+        "printedAt": period.get("printedAt", ""),
+        "sheetName": sheet_name,
+        "headerRow": header_row,
+        "columnCount": max((int(spec["position"]) for spec in PORTMIS_HEADER_SPECS), default=0),
+        "columnMap": {field: index + 1 for field, index in column_indexes.items()},
+        "count": len(items),
+        "portCounts": dict(sorted(port_counts.items(), key=lambda kv: kv[0])),
+        "movementCounts": dict(sorted(movement_counts.items(), key=lambda kv: kv[0])),
+        "sample": items[:3],
+        "etaPolicy": {
+            "representativeEtaPriority": ["PORTWISE", "PORT_MIS"],
+            "portmisPriority": 2,
+            "description": "PORT-MIS는 사전 예정 자료이며, PORTWISE ETA가 있으면 앱에서 PORTWISE를 대표 ETA로 우선 표시합니다.",
         },
         "items": items,
     }
