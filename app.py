@@ -44,7 +44,7 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "60"))
 
-SERVER_VERSION = "3.1.9-portmis-header-parser"
+SERVER_VERSION = "3.2.0-event-time-payload-fix"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
@@ -124,6 +124,61 @@ def parse_iso_time(value: str):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+AIS_SOURCE_TIME_KEYS = [
+    "eventTime",
+    "sourceTime",
+    "timestamp",
+    "lastUpdated",
+    "lastUpdateTime",
+    "updatedAt",
+    "aisTime",
+    "receivedAt",
+    "receivedTime",
+    "receiveTime",
+    "positionTime",
+    "posTime",
+    "updtTm",
+    "updtDt",
+    "updateTime",
+    "updTime",
+    "dataTime",
+    "gpsTime",
+    "baseTime",
+    "regDt",
+    "regDate",
+    "last_seen",
+    "lastSeen",
+    "lstUpdDt",
+    "lstUpdTm",
+]
+
+
+def normalize_event_time(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text == "-":
+        return ""
+
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) == 14:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}T{digits[8:10]}:{digits[10:12]}:{digits[12:14]}"
+    if len(digits) == 12:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}T{digits[8:10]}:{digits[10:12]}:00"
+
+    normalized = text.replace("/", "-")
+    if " " in normalized and "T" not in normalized:
+        normalized = normalized.replace(" ", "T", 1)
+    return normalized
+
+
+def pick_source_time(item: Dict[str, Any]) -> str:
+    for key in AIS_SOURCE_TIME_KEYS:
+        value = item.get(key)
+        picked = normalize_event_time(value)
+        if picked:
+            return picked
+    return ""
 
 
 def seconds_since_iso(value: str):
@@ -210,7 +265,7 @@ def is_special_event_type(event_type: str) -> bool:
     return any(str(event_type).startswith(prefix) for prefix in SPECIAL_EVENT_PREFIXES)
 
 
-def should_send_ais_alert(ship_name: str, event_type: str, force: bool = False) -> tuple[bool, str]:
+def should_send_ais_alert(ship_name: str, event_type: str, force: bool = False, event_time: str = "") -> tuple[bool, str]:
     """
     일반 이벤트: 같은 선박 + 같은 이벤트는 AIS_ALERT_COOLDOWN_MINUTES 동안 차단합니다.
     특수 이벤트: berth_approaching/completed, anchorage_approaching/completed 계열은
@@ -243,6 +298,7 @@ def should_send_ais_alert(ship_name: str, event_type: str, force: bool = False) 
             "shipName": normalized_ship,
             "eventType": event_type,
             "special": True,
+            "eventTime": event_time,
             "sentAt": now.isoformat(),
         }
         write_json(AIS_ALERT_FILE, cleanup_alert_state(state, now))
@@ -258,6 +314,7 @@ def should_send_ais_alert(ship_name: str, event_type: str, force: bool = False) 
         "shipName": normalized_ship,
         "eventType": event_type,
         "special": False,
+        "eventTime": event_time,
         "sentAt": now.isoformat(),
     }
 
@@ -2390,6 +2447,8 @@ def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
     status = str(info.get("status", "-"))
     location = str(info.get("location") or simple_area_from_lat_lon(lat, lon))
     flow = flow_stage_from_snapshot(location, status, speed)
+    created_at = now_iso()
+    source_time = normalize_event_time(info.get("sourceTime")) or created_at
 
     return {
         "shipName": normalize_ship_name(ship_name),
@@ -2404,7 +2463,10 @@ def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
         "flowLabel": flow.get("label", "추적중"),
         "destination": str(info.get("destination", "-")),
         "eta": str(info.get("eta", "-")),
-        "seenAt": now_iso(),
+        "sourceTime": source_time,
+        "eventTime": source_time,
+        "createdAt": created_at,
+        "seenAt": created_at,
     }
 
 
@@ -2709,6 +2771,7 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
                 "location": simple_area_from_lat_lon(lat, lon),
                 "destination": pick_text(item, ["destination", "dest", "dstn", "etaDest"], "-"),
                 "eta": pick_text(item, ["eta", "etaTime", "arrvTm"], "-"),
+                "sourceTime": pick_source_time(item),
             }
 
     previous_state = read_json(AIS_SHIP_STATE_FILE, {})
@@ -2771,9 +2834,13 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
 
         for event in ship_events:
             event_type = event["eventType"]
-            can_send, reason = should_send_ais_alert(ship_name, event_type, force=force)
+            event_time = normalize_event_time(event.get("eventTime")) or str(current_snapshot.get("eventTime") or current_snapshot.get("sourceTime") or current_snapshot.get("seenAt") or now_iso())
+            source_time = normalize_event_time(event.get("sourceTime")) or str(current_snapshot.get("sourceTime") or event_time)
+            created_at = now_iso()
+            sent_at = now_iso()
+            can_send, reason = should_send_ais_alert(ship_name, event_type, force=force, event_time=event_time)
             if not can_send:
-                skipped.append({"shipName": ship_name, "eventType": event_type, "reason": reason})
+                skipped.append({"shipName": ship_name, "eventType": event_type, "eventTime": event_time, "reason": reason})
                 continue
 
             result = send_fcm_to_tokens(
@@ -2790,7 +2857,10 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
                     "zoneType": str(current_snapshot.get("zoneType", "unknown")),
                     "flowStage": str(current_snapshot.get("flowStage", "TRACKING")),
                     "flowLabel": str(current_snapshot.get("flowLabel", "추적중")),
-                    "sentAt": now_iso(),
+                    "eventTime": event_time,
+                    "sourceTime": source_time,
+                    "createdAt": created_at,
+                    "sentAt": sent_at,
                 },
             )
 
@@ -2798,11 +2868,16 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
                 "shipName": ship_name,
                 "eventType": event_type,
                 "title": event["title"],
+                "body": event["body"],
+                "eventTime": event_time,
+                "sourceTime": source_time,
+                "createdAt": created_at,
+                "sentAt": sent_at,
                 "success": result["success"],
             })
 
             if result["success"] > 0:
-                sent.append({"shipName": ship_name, "eventType": event_type})
+                sent.append({"shipName": ship_name, "eventType": event_type, "eventTime": event_time, "sentAt": sent_at})
             if result["errors"]:
                 errors.extend(result["errors"])
 
@@ -2823,6 +2898,7 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
     if baseline_pending_changed:
         write_json(AIS_BASELINE_FILE, baseline_pending)
 
+    checked_at = now_iso()
     result_payload = {
         "ok": True,
         "source": source,
@@ -2840,7 +2916,9 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
         "force": force,
         "cooldownMinutes": AIS_ALERT_COOLDOWN_MINUTES,
         "errors": errors[:5],
-        "time": now_iso(),
+        "createdAt": checked_at,
+        "sentAt": checked_at,
+        "time": checked_at,
     }
 
     history = read_json(EVENT_FILE, [])
