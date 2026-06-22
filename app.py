@@ -44,8 +44,12 @@ AIS_ALERT_COOLDOWN_MINUTES = int(os.environ.get("AIS_ALERT_COOLDOWN_MINUTES", "3
 AUTO_CHECK_ENABLED = os.environ.get("AUTO_CHECK_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y", "on")
 AUTO_CHECK_INTERVAL_SECONDS = int(os.environ.get("AUTO_CHECK_INTERVAL_SECONDS", "60"))
 
-SERVER_VERSION = "3.2.0-event-time-payload-fix"
+SERVER_VERSION = "3.2.2-outside-managed-area-suppress"
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
+
+MANAGED_POINT_BUFFER_KM = float(os.environ.get("ULSAN_MANAGED_POINT_BUFFER_KM", "1.5"))
+MANAGED_ANCHORAGE_BUFFER_KM = float(os.environ.get("ULSAN_MANAGED_ANCHORAGE_BUFFER_KM", "2.0"))
+MANAGED_FAIRWAY_BUFFER_KM = float(os.environ.get("ULSAN_MANAGED_FAIRWAY_BUFFER_KM", "2.5"))
 
 # 3.1.2 서버 상태 진단/자동감시 워치독 설정
 # Render 유료 전환 후에도 감시 루프가 실제로 계속 도는지 앱/브라우저에서 확인하기 위한 값입니다.
@@ -2257,6 +2261,133 @@ def simple_area_from_lat_lon(lat: float, lon: float) -> str:
 
 
 
+def _nearest_point_area_margin_km(lat: float, lon: float, areas: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    nearest = None
+    nearest_margin = 999.0
+    for area in areas:
+        try:
+            area_lat = float(area["lat"])
+            area_lon = float(area["lon"])
+            radius_km = float(area.get("radius_m", 0)) / 1000.0
+        except Exception:
+            continue
+        distance_km = _distance_km(lat, lon, area_lat, area_lon)
+        margin_km = distance_km - radius_km
+        if margin_km < nearest_margin:
+            nearest_margin = margin_km
+            nearest = {
+                "name": str(area.get("display") or area.get("name") or "managed_point"),
+                "distanceKm": round(distance_km, 3),
+                "marginKm": round(margin_km, 3),
+            }
+    return nearest
+
+
+def _nearest_polygon_distance_km(lat: float, lon: float, areas: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    nearest = None
+    nearest_km = 999.0
+    for area in areas:
+        coords = area.get("coords", [])
+        if not coords:
+            continue
+        if point_in_polygon(lat, lon, coords):
+            return {
+                "name": str(area.get("name") or "managed_polygon"),
+                "distanceKm": 0.0,
+                "inside": True,
+            }
+        points = list(coords)
+        points.append(_polygon_center(coords))
+        for point_lat, point_lon in points:
+            distance_km = _distance_km(lat, lon, point_lat, point_lon)
+            if distance_km < nearest_km:
+                nearest_km = distance_km
+                nearest = {
+                    "name": str(area.get("name") or "managed_polygon"),
+                    "distanceKm": round(distance_km, 3),
+                    "inside": False,
+                }
+    return nearest
+
+
+def managed_area_decision_from_lat_lon(lat: float, lon: float) -> Dict[str, Any]:
+    if lat == 0 or lon == 0:
+        return {
+            "managedArea": False,
+            "managedAreaReason": "no_position",
+            "managedAreaZone": "",
+            "managedAreaDistanceKm": None,
+        }
+
+    exact_checks = [
+        ("anchorage", anchorage_zone_from_lat_lon(lat, lon)),
+        ("buoy", buoy_zone_from_lat_lon(lat, lon)),
+        ("berth", berth_zone_from_lat_lon(lat, lon)),
+        ("fairway", fairway_zone_from_lat_lon(lat, lon)),
+    ]
+    for reason, zone in exact_checks:
+        if zone:
+            return {
+                "managedArea": True,
+                "managedAreaReason": reason,
+                "managedAreaZone": zone,
+                "managedAreaDistanceKm": 0.0,
+            }
+
+    nearest_candidates = []
+
+    point_nearest = _nearest_point_area_margin_km(lat, lon, BUOY_AREAS + MAIN_BERTH_AREAS + OTHER_BERTH_AREAS)
+    if point_nearest:
+        point_nearest["kind"] = "point_buffer"
+        nearest_candidates.append(point_nearest)
+        if float(point_nearest["marginKm"]) <= MANAGED_POINT_BUFFER_KM:
+            return {
+                "managedArea": True,
+                "managedAreaReason": "point_buffer",
+                "managedAreaZone": point_nearest["name"],
+                "managedAreaDistanceKm": point_nearest["distanceKm"],
+            }
+
+    anchorage_nearest = _nearest_polygon_distance_km(lat, lon, ANCHORAGE_AREAS)
+    if anchorage_nearest:
+        anchorage_nearest["kind"] = "anchorage_buffer"
+        nearest_candidates.append(anchorage_nearest)
+        if float(anchorage_nearest["distanceKm"]) <= MANAGED_ANCHORAGE_BUFFER_KM:
+            return {
+                "managedArea": True,
+                "managedAreaReason": "anchorage_buffer",
+                "managedAreaZone": anchorage_nearest["name"],
+                "managedAreaDistanceKm": anchorage_nearest["distanceKm"],
+            }
+
+    fairway_nearest = _nearest_polygon_distance_km(lat, lon, FAIRWAY_AREAS)
+    if fairway_nearest:
+        fairway_nearest["kind"] = "fairway_buffer"
+        nearest_candidates.append(fairway_nearest)
+        if float(fairway_nearest["distanceKm"]) <= MANAGED_FAIRWAY_BUFFER_KM:
+            return {
+                "managedArea": True,
+                "managedAreaReason": "fairway_buffer",
+                "managedAreaZone": fairway_nearest["name"],
+                "managedAreaDistanceKm": fairway_nearest["distanceKm"],
+            }
+
+    nearest_candidates.sort(key=lambda item: float(item.get("marginKm", item.get("distanceKm", 999.0))))
+    nearest = nearest_candidates[0] if nearest_candidates else {}
+    return {
+        "managedArea": False,
+        "managedAreaReason": "outside_managed_area",
+        "managedAreaZone": str(nearest.get("name", "")),
+        "managedAreaDistanceKm": nearest.get("marginKm", nearest.get("distanceKm")),
+    }
+
+
+def should_suppress_outside_managed_area_event(current: Dict[str, Any], event_type: str) -> bool:
+    if str(event_type or "").startswith("ais_first_detected"):
+        return False
+    return not bool(current.get("managedArea", False))
+
+
 def normalize_zone_id(value: str) -> str:
     zone = str(value or "").strip().upper()
     zone = zone.replace(" ", "_").replace("/", "_").replace("-", "_")
@@ -2447,6 +2578,7 @@ def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
     status = str(info.get("status", "-"))
     location = str(info.get("location") or simple_area_from_lat_lon(lat, lon))
     flow = flow_stage_from_snapshot(location, status, speed)
+    managed_area = managed_area_decision_from_lat_lon(lat, lon)
     created_at = now_iso()
     source_time = normalize_event_time(info.get("sourceTime")) or created_at
 
@@ -2461,6 +2593,10 @@ def build_ship_snapshot(ship_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
         "zoneType": flow.get("zoneType", "unknown"),
         "flowStage": flow.get("code", "TRACKING"),
         "flowLabel": flow.get("label", "추적중"),
+        "managedArea": bool(managed_area.get("managedArea", False)),
+        "managedAreaReason": str(managed_area.get("managedAreaReason", "")),
+        "managedAreaZone": str(managed_area.get("managedAreaZone", "")),
+        "managedAreaDistanceKm": managed_area.get("managedAreaDistanceKm"),
         "destination": str(info.get("destination", "-")),
         "eta": str(info.get("eta", "-")),
         "sourceTime": source_time,
@@ -2781,6 +2917,7 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
     skipped = []
     errors = []
     event_results = []
+    outside_managed_area_skipped = []
     baseline_skipped = []
     baseline_pending = read_json(AIS_BASELINE_FILE, {})
     if not isinstance(baseline_pending, dict):
@@ -2838,6 +2975,36 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
             source_time = normalize_event_time(event.get("sourceTime")) or str(current_snapshot.get("sourceTime") or event_time)
             created_at = now_iso()
             sent_at = now_iso()
+            if should_suppress_outside_managed_area_event(current_snapshot, event_type):
+                skip_item = {
+                    "source": source,
+                    "shipName": ship_name,
+                    "eventType": event_type,
+                    "reason": "outside_managed_area",
+                    "lat": current_snapshot.get("lat"),
+                    "lon": current_snapshot.get("lon"),
+                    "locationLabel": str(current_snapshot.get("location", "")),
+                    "managedArea": False,
+                    "managedAreaReason": str(current_snapshot.get("managedAreaReason", "outside_managed_area")),
+                    "managedAreaZone": str(current_snapshot.get("managedAreaZone", "")),
+                    "managedAreaDistanceKm": current_snapshot.get("managedAreaDistanceKm"),
+                    "eventTime": event_time,
+                    "sourceTime": source_time,
+                    "createdAt": created_at,
+                }
+                skipped.append(skip_item)
+                outside_managed_area_skipped.append(skip_item)
+                continue
+
+            if not bool(current_snapshot.get("managedArea", False)) and str(event_type).startswith("ais_first_detected"):
+                event["title"] = f"📍 {ship_name} AIS 최초 감지 · 울산항 외곽"
+                event["body"] = (
+                    f"{ship_name} 선박이 AIS에서 처음 감지되었습니다.\n"
+                    f"현재 위치는 울산항 주요 관리권역 밖입니다.\n"
+                    f"📍 현재 구역: {current_snapshot.get('location', '-')}\n"
+                    f"⚡ 속도: {float(current_snapshot.get('speed', 0.0) or 0.0):.1f} kn"
+                )
+
             can_send, reason = should_send_ais_alert(ship_name, event_type, force=force, event_time=event_time)
             if not can_send:
                 skipped.append({"shipName": ship_name, "eventType": event_type, "eventTime": event_time, "reason": reason})
@@ -2857,6 +3024,10 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
                     "zoneType": str(current_snapshot.get("zoneType", "unknown")),
                     "flowStage": str(current_snapshot.get("flowStage", "TRACKING")),
                     "flowLabel": str(current_snapshot.get("flowLabel", "추적중")),
+                    "managedArea": str(bool(current_snapshot.get("managedArea", False))).lower(),
+                    "managedAreaReason": str(current_snapshot.get("managedAreaReason", "")),
+                    "managedAreaZone": str(current_snapshot.get("managedAreaZone", "")),
+                    "managedAreaDistanceKm": str(current_snapshot.get("managedAreaDistanceKm", "")),
                     "eventTime": event_time,
                     "sourceTime": source_time,
                     "createdAt": created_at,
@@ -2869,6 +3040,10 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
                 "eventType": event_type,
                 "title": event["title"],
                 "body": event["body"],
+                "managedArea": bool(current_snapshot.get("managedArea", False)),
+                "managedAreaReason": str(current_snapshot.get("managedAreaReason", "")),
+                "managedAreaZone": str(current_snapshot.get("managedAreaZone", "")),
+                "managedAreaDistanceKm": current_snapshot.get("managedAreaDistanceKm"),
                 "eventTime": event_time,
                 "sourceTime": source_time,
                 "createdAt": created_at,
@@ -2910,6 +3085,8 @@ def perform_ais_check_once(force: bool = False, source: str = "manual") -> Dict[
         "events": event_results,
         "sentShips": sent,
         "skippedShips": skipped,
+        "outsideManagedAreaSkippedCount": len(outside_managed_area_skipped),
+        "outsideManagedAreaSkippedShips": outside_managed_area_skipped[:50],
         "baselineSkippedShips": baseline_skipped,
         "baselineSkippedCount": len(baseline_skipped),
         "baselinePendingCount": safe_len(baseline_pending) if isinstance(baseline_pending, dict) else 0,
@@ -3500,10 +3677,15 @@ def zone_test():
     berth_debug = berth_debug_payload(lat_f, lon_f)
     fairway_debug = fairway_debug_payload(lat_f, lon_f)
     decision = resolve_zone_decision(lat_f, lon_f)
+    managed_area = managed_area_decision_from_lat_lon(lat_f, lon_f)
     return jsonify({
         "ok": True,
         "lat": lat_f,
         "lon": lon_f,
+        "managedArea": managed_area.get("managedArea"),
+        "managedAreaReason": managed_area.get("managedAreaReason"),
+        "managedAreaZone": managed_area.get("managedAreaZone"),
+        "managedAreaDistanceKm": managed_area.get("managedAreaDistanceKm"),
         "area": decision["selectedZone"],
         "selectedZone": decision["selectedZone"],
         "selectedZoneType": decision["zoneType"],
